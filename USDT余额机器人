@@ -1,0 +1,841 @@
+import os
+import sys
+import time
+import base64
+import hashlib
+import threading
+import configparser
+from decimal import Decimal, ROUND_DOWN
+from typing import List, Tuple, Optional
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+import requests
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QTextEdit,
+    QGridLayout, QHBoxLayout, QVBoxLayout, QGroupBox, QMessageBox
+)
+
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+USDT_DECIMALS = 6
+TRON_EMPTY_OWNER = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"
+
+TG_API_BASE = "https://api.telegram.org"
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+SEP = " ｜ "
+
+
+def app_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def ensure_file(path: str, default_content: str = ""):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(default_content)
+
+
+def load_lines(path: str) -> List[str]:
+    ensure_file(path, "")
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f.readlines()]
+
+
+def save_lines(path: str, lines: List[str]):
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+
+def normalize_whitelist(s: str) -> List[int]:
+    ids = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except Exception:
+            continue
+    return ids
+
+
+def parse_nodes(s: str) -> List[str]:
+    out = []
+    for part in (s or "").split(","):
+        u = part.strip()
+        if not u:
+            continue
+        out.append(u.rstrip("/"))
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def safe_int(s: str, default=0) -> int:
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return default
+
+
+def safe_float(s: str, default=0.2) -> float:
+    try:
+        return float(str(s).strip())
+    except Exception:
+        return default
+
+
+def short_text(s: str, n: int = 200) -> str:
+    s = str(s)
+    return s if len(s) <= n else s[:n] + " ..."
+
+
+def try_decode_b64(s: str) -> str:
+    if not s:
+        return ""
+    try:
+        b = base64.b64decode(s)
+        return b.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def short_addr(addr: str, head: int = 6, tail: int = 6) -> str:
+    addr = (addr or "").strip()
+    if len(addr) <= head + tail + 3:
+        return addr
+    return f"{addr[:head]}...{addr[-tail:]}"
+
+
+def extract_param(text: str, keyword: str) -> str:
+    t = (text or "").strip()
+    if not t.startswith(keyword):
+        return ""
+    return t[len(keyword):].strip()
+
+
+# ---------- TRON 地址 base58check ----------
+def b58decode_int(s: str) -> int:
+    n = 0
+    for ch in s:
+        n *= 58
+        idx = _B58_ALPHABET.find(ch)
+        if idx == -1:
+            raise ValueError("Invalid base58 char")
+        n += idx
+    return n
+
+
+def b58decode_check(addr: str) -> bytes:
+    addr = addr.strip()
+    if not addr:
+        raise ValueError("empty address")
+
+    num = b58decode_int(addr)
+    full = num.to_bytes((num.bit_length() + 7) // 8, byteorder="big") if num > 0 else b"\x00"
+
+    pad = 0
+    for c in addr:
+        if c == "1":
+            pad += 1
+        else:
+            break
+    full = (b"\x00" * pad) + full
+
+    if len(full) < 5:
+        raise ValueError("invalid length")
+
+    payload, checksum = full[:-4], full[-4:]
+    h = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if checksum != h:
+        raise ValueError("checksum mismatch")
+    return payload
+
+
+def tron_address_to_41hex(addr: str) -> str:
+    payload = b58decode_check(addr)
+    if len(payload) != 21 or payload[0] != 0x41:
+        raise ValueError("not a TRON mainnet address")
+    return payload.hex()
+
+
+def make_balanceof_parameter_32bytes(addr: str) -> str:
+    h = tron_address_to_41hex(addr)
+    return ("0" * (64 - len(h))) + h
+
+
+# ---------- 地址文件管理（✅修复死锁） ----------
+class AddressBook:
+    def __init__(self, path: str):
+        self.path = path
+        ensure_file(self.path, "")
+        self.lock = threading.RLock()  # ✅ 可重入锁，避免死锁
+
+    def list_addresses(self) -> List[str]:
+        with self.lock:
+            lines = load_lines(self.path)
+            addrs = []
+            for line in lines:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                addrs.append(s)
+
+            seen = set()
+            uniq = []
+            for a in addrs:
+                if a not in seen:
+                    seen.add(a)
+                    uniq.append(a)
+            return uniq
+
+    def add_address(self, addr: str) -> Tuple[bool, str]:
+        addr = (addr or "").strip()
+        if not addr:
+            return False, "地址为空"
+        try:
+            tron_address_to_41hex(addr)
+        except Exception as e:
+            return False, f"地址格式不对：{e}"
+
+        with self.lock:
+            # ✅ 不再调用 list_addresses()（避免锁里再进锁的风险）
+            existing = set(self.list_addresses())  # RLock 下也安全
+            if addr in existing:
+                return False, "地址已存在"
+
+            lines = load_lines(self.path)
+            lines.append(addr)
+            save_lines(self.path, lines)
+            return True, "新增成功"
+
+    def remove_address(self, addr: str) -> Tuple[bool, str]:
+        addr = (addr or "").strip()
+        if not addr:
+            return False, "地址为空"
+
+        with self.lock:
+            lines = load_lines(self.path)
+            new_lines = []
+            removed = False
+            for line in lines:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    new_lines.append(line)
+                    continue
+                if s == addr:
+                    removed = True
+                    continue
+                new_lines.append(line)
+
+            if removed:
+                save_lines(self.path, new_lines)
+                return True, "删除成功"
+            return False, "地址不存在"
+
+
+# ---------- 合约只读查询 ----------
+class TronUSDTChecker:
+    def __init__(self, nodes: List[str], timeout_sec: int = 12, retries_per_node: int = 1):
+        self.nodes = nodes[:] if nodes else ["https://api.trongrid.io"]
+        self.timeout_sec = int(timeout_sec)
+        self.retries_per_node = max(0, int(retries_per_node))
+        self.session = requests.Session()
+
+    def _call_triggerconstantcontract(self, node_base: str, addr: str) -> Tuple[Optional[Decimal], str]:
+        url = f"{node_base.rstrip('/')}/wallet/triggerconstantcontract"
+        param = make_balanceof_parameter_32bytes(addr)
+        payload = {
+            "owner_address": TRON_EMPTY_OWNER,
+            "contract_address": USDT_CONTRACT,
+            "function_selector": "balanceOf(address)",
+            "parameter": param,
+            "visible": True
+        }
+
+        t0 = time.time()
+        try:
+            r = self.session.post(url, json=payload, timeout=self.timeout_sec)
+            dt = (time.time() - t0) * 1000.0
+            status = r.status_code
+
+            text = r.text
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+
+            if status != 200:
+                msg_dec = ""
+                if isinstance(j, dict):
+                    msg_dec = try_decode_b64(str(j.get("message", "") or ""))
+                log = f"node={node_base} status={status} cost={dt:.0f}ms resp={short_text(text)}"
+                if msg_dec:
+                    log += f" msg={short_text(msg_dec)}"
+                return None, log
+
+            if isinstance(j, dict):
+                result_field = j.get("result", None)
+                if (isinstance(result_field, dict) and result_field.get("result") is False) or (result_field is False):
+                    msg_b64 = str(j.get("message", "") or "")
+                    msg_dec = try_decode_b64(msg_b64)
+                    return None, f"node={node_base} status=200 cost={dt:.0f}ms result=false msg={short_text(msg_dec or msg_b64)}"
+
+                const_res = j.get("constant_result") or []
+                if not const_res:
+                    msg_b64 = str(j.get("message", "") or "")
+                    msg_dec = try_decode_b64(msg_b64)
+                    return None, f"node={node_base} status=200 cost={dt:.0f}ms no_constant_result msg={short_text(msg_dec or msg_b64)}"
+
+                hex_val = const_res[0]
+                n = int(hex_val, 16)
+                bal = (Decimal(n) / (Decimal(10) ** USDT_DECIMALS)).quantize(
+                    Decimal("0." + "0" * USDT_DECIMALS),
+                    rounding=ROUND_DOWN
+                )
+                return bal, f"node={node_base} status=200 cost={dt:.0f}ms ok balance={bal}"
+
+            return None, f"node={node_base} status=200 cost={dt:.0f}ms json_parse_failed resp={short_text(text)}"
+
+        except Exception as e:
+            dt = (time.time() - t0) * 1000.0
+            return None, f"node={node_base} EXC cost={dt:.0f}ms err={repr(e)}"
+
+    def query_usdt_balance_with_debug(self, addr: str) -> Tuple[Decimal, List[str]]:
+        _ = tron_address_to_41hex(addr)
+        logs = []
+        last_err = None
+
+        for node in self.nodes:
+            attempts = 1 + self.retries_per_node
+            for k in range(1, attempts + 1):
+                bal, log = self._call_triggerconstantcontract(node, addr)
+                logs.append(f"[try {k}/{attempts}] {log}")
+                if bal is not None:
+                    return bal, logs
+                last_err = log
+                time.sleep(0.15)
+
+        raise RuntimeError(f"所有节点都失败：{last_err}")
+
+
+# ---------- Telegram Worker ----------
+class TelegramBotWorker(QThread):
+    log = pyqtSignal(str)
+    status = pyqtSignal(str)
+
+    def __init__(
+        self,
+        bot_token: str,
+        group_id: int,
+        whitelist_ids: List[int],
+        checker: TronUSDTChecker,
+        addrbook: AddressBook,
+        delay_sec: float = 0.2,
+        parent=None
+    ):
+        super().__init__(parent)
+        self.bot_token = (bot_token or "").strip()
+        self.group_id = group_id
+        self._whitelist_lock = threading.Lock()
+        self.whitelist = set(whitelist_ids or [])
+        self.checker = checker
+        self.addrbook = addrbook
+        self.delay_sec = max(0.0, float(delay_sec))
+        self._stop_flag = threading.Event()
+        self._session = requests.Session()
+        self._offset = 0
+
+    def stop(self):
+        self._stop_flag.set()
+
+    # ===== 白名单热更新：保存配置后立即生效 =====
+    def set_whitelist(self, whitelist_ids: List[int]):
+        """线程安全更新白名单。"""
+        with self._whitelist_lock:
+            self.whitelist = set(whitelist_ids or [])
+
+    def is_whitelisted(self, user_id: int) -> bool:
+        with self._whitelist_lock:
+            return user_id in self.whitelist
+
+    def _tg(self, method: str):
+        return f"{TG_API_BASE}/bot{self.bot_token}/{method}"
+
+    def _send_message(self, chat_id: int, text: str):
+        try:
+            self._session.post(
+                self._tg("sendMessage"),
+                json={"chat_id": chat_id, "text": text},
+                timeout=12
+            )
+        except Exception as e:
+            self.log.emit(f"[Telegram] 发送失败：{e}")
+
+    def _send_lines_in_chunks(self, chat_id: int, lines: List[str], limit: int = 3800):
+        buf = ""
+        for line in lines:
+            add = (line + "\n")
+            if len(buf) + len(add) > limit:
+                if buf.strip():
+                    self._send_message(chat_id, buf.rstrip("\n"))
+                buf = ""
+            buf += add
+        if buf.strip():
+            self._send_message(chat_id, buf.rstrip("\n"))
+
+    @staticmethod
+    def _is_cmd_check_id(text: str) -> bool:
+        t = (text or "").strip()
+        return t in ("查id", "查ID", "查Id", "查iD", "id", "ID")
+
+    def _handle_balance(self, chat_id: int):
+        addrs = self.addrbook.list_addresses()
+        if not addrs:
+            self._send_message(chat_id, "地址列表为空（addresses.txt 里没有地址）")
+            return
+
+        out_lines: List[str] = []
+        ok_cnt = 0
+        fail_cnt = 0
+        total = Decimal("0").quantize(Decimal("0." + "0" * USDT_DECIMALS), rounding=ROUND_DOWN)
+
+        self.log.emit(f"[余额] 开始查询：{len(addrs)} 个地址（格式：短地址{SEP}余额）")
+
+        for i, addr in enumerate(addrs, 1):
+            if self._stop_flag.is_set():
+                self.log.emit("[余额] 已停止")
+                return
+
+            sa = short_addr(addr)
+            try:
+                bal, dbg = self.checker.query_usdt_balance_with_debug(addr)
+                total += bal
+                ok_cnt += 1
+                out_lines.append(f"{i}) {addr}")
+                out_lines.append(str(bal))  # ✅ 下一行放纯余额，方便双击复制
+                self.log.emit(f"[余额][{i}] {sa} OK -> {bal} ({dbg[-1]})")
+            except Exception as e:
+                fail_cnt += 1
+                err = short_text(e, 120)
+                out_lines.append(f"{i}) {addr}")
+                out_lines.append(f"查询失败：{err}")
+                out_lines.append("")
+                self.log.emit(f"[余额][{i}] {sa} FAIL -> {repr(e)}")
+
+            time.sleep(self.delay_sec)
+
+        out_lines.append("")
+        out_lines.append(f"合计{SEP}{total}")
+        out_lines.append(f"成功{SEP}{ok_cnt}")
+        out_lines.append(f"失败{SEP}{fail_cnt}")
+        out_lines.append(f"总地址数{SEP}{len(addrs)}")
+
+        self._send_lines_in_chunks(chat_id, out_lines, limit=3800)
+
+    def _handle_add(self, chat_id: int, addr: str):
+        ok, tip = self.addrbook.add_address(addr)
+        self._send_message(chat_id, f"{tip}\n{addr}".strip())
+        self.log.emit(f"[新增地址] {tip} -> {addr}")
+
+    def _handle_del(self, chat_id: int, addr: str):
+        ok, tip = self.addrbook.remove_address(addr)
+        self._send_message(chat_id, f"{tip}\n{addr}".strip())
+        self.log.emit(f"[删除地址] {tip} -> {addr}")
+
+    def run(self):
+        if not self.bot_token:
+            self.status.emit("机器人未启动（Token为空）")
+            return
+        if not self.group_id:
+            self.status.emit("机器人未启动（群组ID为空）")
+            return
+
+        self.status.emit("机器人运行中")
+        self.log.emit("[机器人] 启动成功，监听：查id / 余额 / 新增地址 / 删除地址")
+        self.log.emit(f"[机器人] 目标群 chat_id={self.group_id} | 白名单用户数={len(self.whitelist)}")
+
+        while not self._stop_flag.is_set():
+            try:
+                resp = self._session.get(
+                    self._tg("getUpdates"),
+                    params={"timeout": 50, "offset": self._offset},
+                    timeout=60
+                )
+                resp.raise_for_status()
+                j = resp.json()
+                if not j.get("ok"):
+                    self.log.emit(f"[机器人] getUpdates ok=false：{short_text(j)}")
+                    time.sleep(1)
+                    continue
+
+                updates = j.get("result", []) or []
+                for upd in updates:
+                    self._offset = max(self._offset, upd.get("update_id", 0) + 1)
+
+                    msg = upd.get("message") or upd.get("channel_post") or {}
+                    raw_text = (msg.get("text") or "").strip()
+                    if not raw_text:
+                        continue
+
+                    chat = msg.get("chat") or {}
+                    chat_id = safe_int(chat.get("id"), 0)
+
+                    frm = msg.get("from") or {}
+                    user_id = safe_int(frm.get("id"), 0)
+
+                    self.log.emit(f"[收到] chat_id={chat_id} user_id={user_id} text={raw_text}")
+
+                    text = raw_text
+                    if text.startswith("/"):
+                        text = text[1:].strip()
+
+                    if chat_id == self.group_id and self._is_cmd_check_id(text):
+                        self._send_message(chat_id, f"你的 user_id：{user_id}\n本群 chat_id：{chat_id}")
+                        self.log.emit("[处理] 查id")
+                        continue
+
+                    if chat_id != self.group_id:
+                        self.log.emit(f"[忽略] 群不匹配：当前={chat_id} 配置={self.group_id}")
+                        continue
+
+                    is_supported_cmd = (text == "余额" or text.startswith("新增地址") or text.startswith("删除地址"))
+
+                    if not self.is_whitelisted(user_id):
+                        self.log.emit(f"[忽略] 不在白名单：user_id={user_id}")
+                        if is_supported_cmd:
+                            self._send_message(chat_id, "无权限：请先发送“查id”获取你的ID，让管理员加入白名单。")
+                        continue
+
+                    if text == "余额":
+                        self.log.emit("[处理] 余额")
+                        self._handle_balance(chat_id)
+                        continue
+
+                    if text.startswith("新增地址"):
+                        addr = extract_param(text, "新增地址")
+                        if not addr:
+                            self._send_message(chat_id, "用法：新增地址 <TRON地址>")
+                            self.log.emit("[处理] 新增地址（缺参数）")
+                        else:
+                            self.log.emit(f"[处理] 新增地址 addr={addr}")
+                            self._handle_add(chat_id, addr)
+                        continue
+
+                    if text.startswith("删除地址"):
+                        addr = extract_param(text, "删除地址")
+                        if not addr:
+                            self._send_message(chat_id, "用法：删除地址 <TRON地址>")
+                            self.log.emit("[处理] 删除地址（缺参数）")
+                        else:
+                            self.log.emit(f"[处理] 删除地址 addr={addr}")
+                            self._handle_del(chat_id, addr)
+                        continue
+
+                    self.log.emit("[忽略] 非支持命令")
+
+            except Exception as e:
+                self.log.emit(f"[机器人] 异常：{repr(e)}")
+                time.sleep(2)
+
+        self.status.emit("机器人已暂停")
+        self.log.emit("[机器人] 已暂停/停止")
+
+
+# ---------- PyQt UI ----------
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setWindowTitle("USDT 余额机器人")
+        self.resize(1050, 720)
+
+        self.base = app_dir()
+        self.cfg_path = os.path.join(self.base, "config.ini")
+        self.addr_path = os.path.join(self.base, "addresses.txt")
+        ensure_file(self.addr_path, "")
+
+        self.addrbook = AddressBook(self.addr_path)
+        self.worker: Optional[TelegramBotWorker] = None
+
+        self._build_ui()
+        self._apply_style()
+        self._load_config()
+
+    def _build_ui(self):
+        self.in_token = QLineEdit()
+        self.in_token.setPlaceholderText("Telegram Bot Token（必填）")
+
+        self.in_group = QLineEdit()
+        self.in_group.setPlaceholderText("群组ID chat_id（必填，例如 -100xxxxxxxxxx）")
+
+        self.in_whitelist = QLineEdit()
+        self.in_whitelist.setPlaceholderText("白名单user_id（逗号分隔，例如 123,456；群里发“查id”获取）")
+
+        self.in_nodes = QLineEdit()
+        self.in_nodes.setPlaceholderText("节点URL列表（逗号分隔，例如 https://api.trongrid.io,https://api.tronstack.io）")
+
+        self.in_delay = QLineEdit()
+        self.in_delay.setPlaceholderText("每个地址查询间隔秒（默认 0.2；更稳可填 1~3）")
+
+        self.in_retries = QLineEdit()
+        self.in_retries.setPlaceholderText("每个节点重试次数（默认 1）")
+
+        self.btn_save = QPushButton("保存配置")
+        self.btn_run = QPushButton("手动运行（查 addresses.txt）")
+        self.btn_start = QPushButton("启动机器人")
+        self.btn_pause = QPushButton("暂停机器人")
+
+        self.btn_save.clicked.connect(self.on_save)
+        self.btn_run.clicked.connect(self.on_manual_run)
+        self.btn_start.clicked.connect(self.on_start_bot)
+        self.btn_pause.clicked.connect(self.on_pause_bot)
+
+        self.logbox = QTextEdit()
+        self.logbox.setReadOnly(True)
+
+        self.lb_status = QLabel("状态：未启动")
+        self.lb_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        form = QGroupBox("配置")
+        grid = QGridLayout()
+
+        grid.addWidget(QLabel("机器人Token"), 0, 0)
+        grid.addWidget(self.in_token, 0, 1, 1, 3)
+
+        grid.addWidget(QLabel("群组ID"), 1, 0)
+        grid.addWidget(self.in_group, 1, 1)
+        grid.addWidget(QLabel("白名单user_id"), 1, 2)
+        grid.addWidget(self.in_whitelist, 1, 3)
+
+        grid.addWidget(QLabel("节点URL列表"), 2, 0)
+        grid.addWidget(self.in_nodes, 2, 1, 1, 3)
+
+        grid.addWidget(QLabel("查询间隔(s)"), 3, 0)
+        grid.addWidget(self.in_delay, 3, 1)
+        grid.addWidget(QLabel("节点重试(次)"), 3, 2)
+        grid.addWidget(self.in_retries, 3, 3)
+
+        grid.addWidget(QLabel("地址文件"), 4, 2)
+        grid.addWidget(QLabel(os.path.basename(self.addr_path)), 4, 3)
+
+        form.setLayout(grid)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_run)
+        btns.addWidget(self.btn_start)
+        btns.addWidget(self.btn_pause)
+        btns.addStretch(1)
+
+        root = QVBoxLayout()
+        root.addWidget(form)
+        root.addLayout(btns)
+        root.addWidget(self.lb_status)
+        root.addWidget(self.logbox, 1)
+        self.setLayout(root)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+        QWidget { font-family: "Microsoft YaHei"; font-size: 10pt; }
+        QGroupBox { border: 1px solid #d0d0d0; border-radius: 10px; margin-top: 10px; padding: 10px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+        QLineEdit { padding: 8px 10px; border: 1px solid #cfcfcf; border-radius: 8px; }
+        QLineEdit:focus { border: 1px solid #5b9bd5; }
+        QPushButton { padding: 9px 14px; border: 0px; border-radius: 10px; background: #5b9bd5; color: white; }
+        QPushButton:hover { background: #4a87c2; }
+        QTextEdit { border: 1px solid #cfcfcf; border-radius: 10px; padding: 10px; background: #ffffff; }
+        QLabel { color: #333; }
+        """)
+
+    def append_log(self, s: str):
+        t = time.strftime("%H:%M:%S")
+        self.logbox.append(f"[{t}] {s}")
+
+        # ✅ 最多保留 2000 行（QTextEdit 里每一行就是一个 block）
+        max_lines = 2000
+        doc = self.logbox.document()
+        extra = doc.blockCount() - max_lines
+        if extra > 0:
+            cursor = self.logbox.textCursor()
+            cursor.movePosition(cursor.Start)
+
+            # 删除多出来的 extra 行
+            for _ in range(extra):
+                cursor.select(cursor.LineUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()  # 删除换行符
+
+            # 可选：把光标移动到末尾，避免闪烁
+            self.logbox.moveCursor(cursor.End)
+
+    def set_status(self, s: str):
+        self.lb_status.setText(f"状态：{s}")
+
+    def _load_config(self):
+        default_nodes = "https://api.trongrid.io,https://api.tronstack.io"
+        if not os.path.exists(self.cfg_path):
+            self.in_nodes.setText(default_nodes)
+            self.in_delay.setText("0.2")
+            self.in_retries.setText("1")
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg.read(self.cfg_path, encoding="utf-8")
+
+        self.in_token.setText(cfg.get("BOT", "token", fallback=""))
+        self.in_group.setText(cfg.get("BOT", "group_id", fallback=""))
+        self.in_whitelist.setText(cfg.get("BOT", "whitelist_user_ids", fallback=""))
+
+        self.in_nodes.setText(cfg.get("TRON", "nodes", fallback=default_nodes))
+        self.in_delay.setText(cfg.get("TRON", "delay_sec", fallback="0.2"))
+        self.in_retries.setText(cfg.get("TRON", "retries_per_node", fallback="1"))
+
+        self.append_log("已加载 config.ini")
+
+    def on_save(self):
+        cfg = configparser.ConfigParser()
+        cfg["BOT"] = {
+            "token": self.in_token.text().strip(),
+            "group_id": self.in_group.text().strip(),
+            "whitelist_user_ids": self.in_whitelist.text().strip(),
+        }
+        cfg["TRON"] = {
+            "nodes": (self.in_nodes.text().strip() or "https://api.trongrid.io"),
+            "delay_sec": (self.in_delay.text().strip() or "0.2"),
+            "retries_per_node": (self.in_retries.text().strip() or "1"),
+        }
+
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+        self.append_log("配置已保存到 config.ini")
+        # ✅ 保存配置后，运行中的机器人立即更新白名单（无需重启程序）
+        if self.worker and self.worker.isRunning():
+            new_wl = normalize_whitelist(self.in_whitelist.text().strip())
+            try:
+                self.worker.set_whitelist(new_wl)
+                self.append_log(f"运行中白名单已更新：{len(new_wl)} 人")
+            except Exception as e:
+                self.append_log(f"更新白名单失败：{e}")
+        QMessageBox.information(self, "提示", "保存成功")
+
+    def _build_checker(self) -> TronUSDTChecker:
+        nodes = parse_nodes(self.in_nodes.text().strip())
+        if not nodes:
+            nodes = ["https://api.trongrid.io"]
+        retries = safe_int(self.in_retries.text().strip() or "1", 1)
+        return TronUSDTChecker(nodes=nodes, timeout_sec=12, retries_per_node=retries)
+
+    def on_manual_run(self):
+        checker = self._build_checker()
+        delay = safe_float(self.in_delay.text().strip() or "0.2", 0.2)
+
+        addrs = self.addrbook.list_addresses()
+        if not addrs:
+            QMessageBox.warning(self, "提示", f"地址列表为空：{os.path.basename(self.addr_path)}")
+            return
+
+        self.append_log(f"手动运行：开始查询 {len(addrs)} 个地址（输出：完整地址 + 下一行余额）")
+
+        total = Decimal("0").quantize(Decimal("0." + "0" * USDT_DECIMALS), rounding=ROUND_DOWN)
+        for i, addr in enumerate(addrs, 1):
+            sa = short_addr(addr)
+            try:
+                bal, dbg = checker.query_usdt_balance_with_debug(addr)
+                total += bal
+                self.append_log(f"{i}) {addr}")
+                self.append_log(str(bal))
+                self.append_log(f"    {sa} {dbg[-1]}")
+            except Exception as e:
+                self.append_log(f"{i}) {addr}")
+                self.append_log(f"查询失败：{e}")
+            time.sleep(max(0.0, delay))
+
+        self.append_log(f"合计{SEP}{str(total)}")
+
+    def on_start_bot(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示", "机器人已在运行")
+            return
+
+        token = self.in_token.text().strip()
+        group_id = safe_int(self.in_group.text().strip(), 0)
+        whitelist = normalize_whitelist(self.in_whitelist.text().strip())
+        nodes = parse_nodes(self.in_nodes.text().strip())
+        delay = safe_float(self.in_delay.text().strip() or "0.2", 0.2)
+        retries = safe_int(self.in_retries.text().strip() or "1", 1)
+
+        if not token:
+            QMessageBox.warning(self, "提示", "机器人 Token 不能为空")
+            return
+        if not group_id:
+            QMessageBox.warning(self, "提示", "群组ID不能为空/无效（例如 -100xxxx）")
+            return
+        if not nodes:
+            QMessageBox.warning(self, "提示", "节点URL列表不能为空（至少填一个）")
+            return
+
+        checker = TronUSDTChecker(nodes=nodes, timeout_sec=12, retries_per_node=retries)
+
+        self.worker = TelegramBotWorker(
+            bot_token=token,
+            group_id=group_id,
+            whitelist_ids=whitelist,
+            checker=checker,
+            addrbook=self.addrbook,
+            delay_sec=delay
+        )
+        self.worker.log.connect(self.append_log)
+        self.worker.status.connect(self.set_status)
+        self.worker.start()
+
+        self.set_status("启动中...")
+        self.append_log("机器人启动请求已发出")
+        self.append_log(f"目标群：{group_id} | 白名单数：{len(whitelist)}")
+        self.append_log(f"输出格式：短地址{SEP}余额")
+        self.append_log("提示：如果群里普通文字收不到，请用 /余额 /新增地址 /删除地址 /查id（隐私模式）")
+
+    def on_pause_bot(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.append_log("已请求暂停机器人（稍等片刻生效）")
+        else:
+            self.append_log("机器人未运行")
+
+    def closeEvent(self, event):
+        try:
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+                self.worker.wait(1500)
+        except Exception:
+            pass
+        event.accept()
+
+
+def main():
+    ensure_file(os.path.join(app_dir(), "addresses.txt"), "")
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
