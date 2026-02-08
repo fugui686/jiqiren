@@ -1,0 +1,523 @@
+import sys
+import time
+import re
+import urllib
+import threading
+import configparser
+import requests
+from functools import partial
+from bs4 import BeautifulSoup
+
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QTextEdit, QPushButton, QFormLayout, QMessageBox, QGroupBox, QStackedWidget,
+    QListWidget, QListWidgetItem
+)
+
+CONFIG_FILE = 'config.ini'
+
+# === 智能模式触发频率（分钟） ===
+INTERVAL_MIN = 2       # 想每 N 分钟触发就填 N（例如 2 / 5 / 10）
+ALIGN_MINUTE = 0       # 偏移分钟（0=在 00,02,04…触发；1=在 01,03,05…触发）
+
+
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("方能同步工具（侧边导航版）")
+        self.resize(880, 700)
+
+        self.fields = {}           # 统一管理所有输入控件
+        self.long_text_field = '方能_cookie'
+
+        self._build_ui()
+        self._load_config()
+
+        # 方能 Cookie 轮询线程（保持登录态）
+        self.polling_thread = threading.Thread(target=self._poll_and_check_cookie_loop, daemon=True)
+        self.polling_thread.start()
+
+    # ===================== UI 构建 =====================
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+
+        # 左侧导航
+        self.nav = QListWidget()
+        self.nav.setFixedWidth(170)
+        self.nav.addItem(QListWidgetItem("🏢 方能配置"))
+        self.nav.addItem(QListWidgetItem("🌈 天鸿配置"))
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+
+        # 右侧页面
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_page_fangneng())
+        self.pages.addWidget(self._build_page_tianhong())
+
+        root.addWidget(self.nav)
+        root.addWidget(self.pages, 1)
+
+        # 默认选中第一页
+        self.nav.setCurrentRow(0)
+
+        # 智能模式定时器
+        self.smart_timer = QTimer()
+        self.smart_timer.timeout.connect(self._check_and_run_smart_mode)
+        self.smart_mode_enabled = False
+
+    def _on_nav_changed(self, idx: int):
+        self.pages.setCurrentIndex(idx)
+
+    # ========== Page 1：方能配置 ==========
+    def _build_page_fangneng(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        # 方能平台配置
+        group_fn = QGroupBox("🏢 方能平台配置")
+        form_fn = QFormLayout()
+        for name in ['方能账号', '方能密码', '方能验证码', '方能域名', 'user-agent', '方能_cookie']:
+            label = QLabel(name)
+            widget = QTextEdit() if name == self.long_text_field else QLineEdit()
+
+            if name in ('方能账号', '方能密码') and isinstance(widget, QLineEdit):
+                widget.setEchoMode(QLineEdit.Password)
+
+            if name == self.long_text_field:
+                widget.setFixedHeight(80)
+
+            form_fn.addRow(label, widget)
+            self.fields[name] = widget
+        group_fn.setLayout(form_fn)
+
+        # Telegram
+        group_tg = QGroupBox("🤖 Telegram 通知")
+        form_tg = QFormLayout()
+        for name in ['机器人Token', '群组ID']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_tg.addRow(label, widget)
+            self.fields[name] = widget
+        group_tg.setLayout(form_tg)
+
+        # 操作按钮（只保留四个）
+        btn_row = QHBoxLayout()
+        btn_save = QPushButton("💾 保存配置")
+        btn_save.clicked.connect(self._save_config)
+
+        btn_run = QPushButton("🚀 运行程序")
+        btn_run.clicked.connect(self._run_all_sync_threaded)
+
+        btn_smart = QPushButton(f"🧠 智能模式（每{INTERVAL_MIN}分钟）")
+        btn_smart.setCheckable(True)
+        btn_smart.clicked.connect(self._toggle_smart_mode)
+
+        btn_login = QPushButton("🔐 登录获取cookie")
+        btn_login.clicked.connect(self._login_fangneng_and_update_cookie)
+
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_run)
+        btn_row.addWidget(btn_smart)
+        btn_row.addWidget(btn_login)
+        btn_row.addStretch()
+
+        main_layout.addWidget(group_fn)
+        main_layout.addWidget(group_tg)
+        main_layout.addLayout(btn_row)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 2：天鸿配置（仅配置项，无按钮） ==========
+    def _build_page_tianhong(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_th = QGroupBox("🌈 天鸿平台设置")
+        form_th = QFormLayout()
+        # 仅保留域名（port）和 cookie
+        for name in ['天鸿域名(port)', '天鸿cookie']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_th.addRow(label, widget)
+            self.fields[name] = widget
+        group_th.setLayout(form_th)
+
+        tips = QLabel("说明：本页仅配置项。点击“方能配置”页的『保存配置』『运行程序』『智能模式』四个按钮统一管理。")
+        tips.setWordWrap(True)
+
+        main_layout.addWidget(group_th)
+        main_layout.addWidget(tips)
+        main_layout.addStretch()
+        return page
+
+    # ===================== 智能模式 =====================
+    def _toggle_smart_mode(self, checked: bool):
+        self.smart_mode_enabled = checked
+        if checked:
+            QMessageBox.information(self, "智能模式", f"✅ 智能模式已开启，将每 {INTERVAL_MIN} 分钟执行一次。")
+            # 每 10 秒检查一次是否到触发窗口
+            self.smart_timer.start(10_000)
+        else:
+            QMessageBox.information(self, "智能模式", "⛔️ 智能模式已关闭。")
+            self.smart_timer.stop()
+
+    def _check_and_run_smart_mode(self):
+        now = time.localtime()
+        if (now.tm_min - ALIGN_MINUTE) % INTERVAL_MIN == 0 and now.tm_sec < 10:
+            print("⏰ 智能模式触发，开始运行程序（统一同步）...")
+            self._run_all_sync_threaded()
+
+    # ============== 方能 Cookie 自动维护（保持登录态） ==============
+    def _poll_and_check_cookie_loop(self):
+        while True:
+            try:
+                domain = self._get_value('方能域名')
+                user_agent = self._get_value('user-agent')
+                current_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+                if not domain or not current_cookie:
+                    print("⏳ [轮询] Cookie 或域名为空，跳过本轮。")
+                    time.sleep(60)
+                    continue
+
+                headers = {
+                    'user-agent': user_agent,
+                    'x-requested-with': 'XMLHttpRequest',
+                    'cookie': current_cookie
+                }
+
+                url = f"https://{domain}/PassManage/Pass/GetPageListJson?page=1&limit=10"
+                res = requests.get(url, headers=headers, timeout=10)
+                print("📦 [轮询] 方能响应状态码：", res.status_code)
+
+                set_cookie = res.headers.get("Set-Cookie", "")
+                match = re.search(r'UserToken=([^;]+)', set_cookie)
+                if match:
+                    new_token = match.group(1)
+                    new_cookie = f"UserToken={new_token}"
+
+                    decoded_old = urllib.parse.unquote(current_cookie.replace("UserToken=", "").strip())
+                    decoded_new = urllib.parse.unquote(new_token.strip())
+
+                    if decoded_new != decoded_old:
+                        print("🔁 [轮询] 检测到 Cookie 更新，自动替换")
+                        QTimer.singleShot(0, partial(self._update_cookie_ui, new_cookie))
+                        QTimer.singleShot(0, partial(QMessageBox.information,
+                                                     self, "Cookie 更新", "🔁 检测到新的 UserToken，已自动更新！"))
+                    else:
+                        print("✅ [轮询] Cookie 内容一致")
+                else:
+                    print("ℹ️ [轮询] 响应中无 Set-Cookie")
+
+            except Exception as e:
+                print("⚠️ [轮询] 检查异常：", str(e))
+
+            print("🕒 [轮询] 等待 5 分钟后继续...")
+            time.sleep(5 * 60)
+
+    def _update_cookie_ui(self, cookie_value: str):
+        w = self.fields.get('方能_cookie')
+        if isinstance(w, QTextEdit):
+            w.setPlainText(cookie_value)
+
+    # ============== 方能登录获取 Cookie ==============
+    def _login_fangneng_and_update_cookie(self):
+        username = self._get_value('方能账号')
+        password = self._get_value('方能密码')
+        googlecode = self._get_value('方能验证码')
+        domain = self._get_value('方能域名')
+        user_agent = self._get_value('user-agent')
+
+        session = requests.Session()
+        headers = {
+            'user-agent': user_agent,
+            'x-requested-with': 'XMLHttpRequest',
+        }
+
+        try:
+            session.get(f"https://{domain}/Home/Login", headers=headers, timeout=5)
+            data = {'username': username, 'password': password, 'googlecode': googlecode}
+            res = session.post(f"https://{domain}/Home/LoginJson", headers=headers, data=data, timeout=10)
+            token = session.cookies.get("UserToken")
+            if token:
+                self._set_value('方能_cookie', f"UserToken={token}", is_text=True)
+                QMessageBox.information(self, "登录成功", f"✅ 登录成功，已获取 UserToken。\n{token}")
+            else:
+                QMessageBox.critical(self, "登录失败", f"❌ 登录失败，响应内容：\n{res.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "异常", f"⚠️ 登录请求异常：{str(e)}")
+
+    # ===================== 配置存取（统一保存所有页面） =====================
+    def _save_config(self):
+        config = configparser.ConfigParser(interpolation=None)
+        config['DEFAULT'] = {
+            k: (v.toPlainText() if isinstance(v, QTextEdit) else v.text())
+            for k, v in self.fields.items()
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                config.write(f)
+            QMessageBox.information(self, "成功", "配置已保存到 config.ini（已保存所有平台配置）")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def _load_config(self):
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read(CONFIG_FILE, encoding='utf-8')
+            for k, w in self.fields.items():
+                if k in config['DEFAULT']:
+                    if isinstance(w, QTextEdit):
+                        w.setPlainText(config['DEFAULT'][k])
+                    else:
+                        w.setText(config['DEFAULT'][k])
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"加载配置失败: {e}")
+
+    # ===================== 工具函数 =====================
+    def _get_value(self, key: str, is_text: bool = False) -> str:
+        w = self.fields.get(key)
+        if not w:
+            return ""
+        if is_text and isinstance(w, QTextEdit):
+            return w.toPlainText()
+        return w.text() if hasattr(w, 'text') else ""
+
+    def _set_value(self, key: str, val: str, is_text: bool = False):
+        w = self.fields.get(key)
+        if not w:
+            return
+        if is_text and isinstance(w, QTextEdit):
+            w.setPlainText(val)
+        elif hasattr(w, 'setText'):
+            w.setText(val)
+
+    # ===================== Telegram =====================
+    def _send_telegram(self, message: str):
+        bot_token = self._get_value('机器人Token')
+        chat_id = self._get_value('群组ID')
+        if not bot_token or not chat_id:
+            print("⚠️ 未配置 Telegram 信息，跳过发送。")
+            return
+        url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+        data = {'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'}
+        try:
+            requests.post(url, data=data, timeout=8)
+        except Exception as e:
+            print(f"发送 Telegram 消息失败: {e}")
+
+    # ===================== 统一“运行程序”入口 =====================
+    def _run_all_sync_threaded(self):
+        t = threading.Thread(target=self._run_all_sync, daemon=True)
+        t.start()
+
+    def _run_all_sync(self):
+        self._send_telegram("✅ 程序启动：统一同步任务开始")
+        # 天鸿 → 方能
+        self._run_tianhong_to_fangneng()
+
+    # ===================== 天鸿→方能 主流程 =====================
+    def _run_tianhong_to_fangneng(self):
+        # 读取配置
+        th_host = self._get_value('天鸿域名(port)').strip()
+        th_cookie = self._get_value('天鸿cookie').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not th_host or not th_cookie or not fn_domain or not fn_ua or not fn_cookie:
+            QMessageBox.warning(self, "缺少配置", "请先填写天鸿域名/cookie 以及方能域名/UA/Cookie。")
+            return
+
+        # self._send_telegram("▶️ 开始：*天鸿* → *方能*（仅更新方能已存在的“天鸿”通道）")
+
+        # 1) 天鸿抓取
+        print("🟡 [天鸿] 开始抓取...")
+        tianhong_url = f"https://{th_host}/user_Channel_index.html"
+        th_headers = {'cookie': th_cookie}
+        tianhong_map = {}  # {code: rate_decimal_4}
+
+        try:
+            html = self._tianhong_get_html(tianhong_url, th_headers)
+            for code, rate_raw in self._tianhong_extract_rows(html):
+                try:
+                    rate_val = self._normalize_rate_to_decimal_4(rate_raw)  # '17.5%' -> 0.1750
+                    tianhong_map[str(code).strip()] = rate_val
+                except Exception as e:
+                    print(f"⚠️ [天鸿] 费率解析失败 ({code}, {rate_raw}): {e}")
+            print(f"✅ [天鸿] 抓取完成，通道数：{len(tianhong_map)}")
+        except Exception as e:
+            print(f"❌ [天鸿] 抓取异常：{e}")
+
+        if not tianhong_map:
+            self._send_telegram("⚠️ [天鸿] 抓取为空，停止本次同步。")
+            return
+
+        # 2) 查询方能 “天鸿” 名下通道
+        print("🟡 [方能] 开始查询“天鸿”通道...")
+        查询接口 = f'https://{fn_domain}/PassManage/Pass/GetPageListJson'
+        更新接口 = f'https://{fn_domain}/PassManage/Pass/EditChannelTypeConf'
+        headers_fn = {'cookie': fn_cookie, 'user-agent': fn_ua, 'x-requested-with': 'XMLHttpRequest'}
+
+        fangneng_items = {}
+        page, limit = 1, 100
+        while True:
+            params = {'page': str(page), 'limit': str(limit), 'name': '天鸿', 'tGGroupId': '', 'state': '1'}
+            try:
+                r = requests.get(查询接口, params=params, headers=headers_fn, timeout=12)
+                if r.status_code != 200:
+                    print(f"❌ [方能] 查询失败，状态码: {r.status_code}")
+                    break
+                js = r.json()
+                page_data = js.get('PageData', []) or js.get('data', []) or []
+                if not page_data:
+                    break
+                for it in page_data:
+                    ch_type = str(it.get('ChannelType', '')).strip()
+                    if ch_type:
+                        fangneng_items[ch_type] = it
+                if len(page_data) < limit:
+                    break
+                page += 1
+            except Exception as e:
+                print(f"⚠️ [方能] 查询异常：{e}")
+                break
+
+        print(f"✅ [方能] 命中“天鸿”通道数：{len(fangneng_items)}")
+        if not fangneng_items:
+            self._send_telegram("⚠️ [方能] 未找到名称为“天鸿”的通道。")
+            return
+
+        # 3) 比对 & 更新
+        print("🟡 开始逐条更新（仅费率不一致才更新，间隔1秒）...")
+        成功数量 = 0
+        跳过数量 = 0
+        未匹配数量 = 0
+        成功列表 = []
+
+        for ch_code, item in fangneng_items.items():
+            target_rate = tianhong_map.get(ch_code)
+            if target_rate is None:
+                未匹配数量 += 1
+                print(f"⏭ [未匹配] 方能有编码 {ch_code}，天鸿未提供，跳过")
+                continue
+
+            current_rate_raw = str(item.get('PassChannelTypeConfRate', '')).strip()
+            try:
+                current_rate = round(float(current_rate_raw), 4)
+            except Exception:
+                try:
+                    if current_rate_raw.endswith('%'):
+                        current_rate = round(float(current_rate_raw[:-1].strip()) / 100.0, 4)
+                    else:
+                        current_rate = round(float(current_rate_raw), 4)
+                except Exception as e:
+                    print(f"⚠️ [费率异常] 编码 {ch_code} 当前费率无法解析({current_rate_raw})：{e}，跳过")
+                    跳过数量 += 1
+                    continue
+
+            if current_rate == target_rate:
+                print(f"⏭ 编码 {ch_code} 费率一致（{current_rate:.4f}），跳过")
+                跳过数量 += 1
+                continue
+
+            payload = {
+                'Id': item.get('PassChannelTypeConfId'),
+                'Status': '1',
+                'PassId': '',
+                'remark': item.get('PassCodeName'),
+                'Rate': f"{target_rate:.4f}",       # 小数形式，四位
+                'AmountRange': item.get('AmountRange'),
+                'ChannelType': item.get('ChannelType'),
+                'AgentRate': '0',
+            }
+            try:
+                res = requests.post(更新接口, data=payload, headers=headers_fn, timeout=12)
+                if res.status_code == 200:
+                    成功数量 += 1
+                    成功列表.append(f"{ch_code} {current_rate:.4f} → {target_rate:.4f}")
+                    print(f"✅ 编码 {ch_code} 更新成功：{current_rate:.4f} → {target_rate:.4f}")
+                else:
+                    print(f"❌ 更新失败 编码 {ch_code}，HTTP {res.status_code}，返回：{res.text[:200]}")
+                time.sleep(1)
+            except Exception as e:
+                print(f"⚠️ 更新异常 编码 {ch_code}：{e}")
+
+        明细文本 = "无" if not 成功列表 else "\n".join(成功列表[:50])
+        msg = (
+            f"📢 *天鸿→方能 费率同步完成*\n"
+            f"✅ 成功更新：*{成功数量}*\n"
+            f"⏭ 费率一致跳过：*{跳过数量}*\n"
+            f"❓ 方能有但天鸿无（跳过）：*{未匹配数量}*\n"
+            f"📦 方能“天鸿”通道总数：*{len(fangneng_items)}*\n"
+            f"🧾 更新明细（前50条）：\n{明细文本}\n"
+            f"⏰ 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        # 改为：只有有实际更新时才发
+        if 成功数量 > 0:
+            self._send_telegram(msg)
+
+        # UI 提示
+        def show_finish():
+            QMessageBox.information(
+                self, "完成",
+                f"✅ 成功更新：{成功数量} 条\n"
+                f"⏭ 费率一致：{跳过数量} 条\n"
+                f"❓ 方能有但天鸿无：{未匹配数量} 条\n"
+                f"📦 方能“天鸿”通道：{len(fangneng_items)} 条"
+            )
+        QTimer.singleShot(0, show_finish)
+
+    # ===================== 天鸿抓取工具 =====================
+    @staticmethod
+    def _tianhong_get_html(url: str, headers: dict) -> str:
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        return resp.text
+
+    @staticmethod
+    def _tianhong_extract_rows(html: str):
+        """
+        解析表格，返回 (通道编码, 通道费率原始字符串)，例如 ('2008', '17.5%')
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        tables = soup.select("table.layui-table")
+        for tbl in tables:
+            thead = tbl.find("thead")
+            if not thead:
+                continue
+            head_text = " ".join(thead.get_text(separator=" ", strip=True).split())
+            if all(k in head_text for k in ["通道编码", "通道费率"]):
+                tbody = tbl.find("tbody")
+                if not tbody:
+                    continue
+                for tr in tbody.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if len(tds) < 3:
+                        continue
+                    code = tds[0].get_text(strip=True)
+                    rate = tds[2].get_text(strip=True)
+                    if code:
+                        yield code, rate
+
+    @staticmethod
+    def _normalize_rate_to_decimal_4(rate_str: str) -> float:
+        """
+        '17.5%' / '17.5' / '17' -> 0.1750（四舍五入到 4 位）
+        """
+        s = (rate_str or "").strip()
+        if s.endswith('%'):
+            s = s[:-1].strip()
+        s = s.replace(',', '')
+        v = float(s) / 100.0
+        return round(v, 4)
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    w = App()
+    w.show()
+    sys.exit(app.exec_())
