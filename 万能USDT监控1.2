@@ -1,0 +1,1769 @@
+import sys
+import os
+import time
+import random
+import hashlib
+import configparser
+import html
+from datetime import datetime, time as dtime
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, Dict, List, Set, Tuple
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QIntValidator, QDoubleValidator
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLineEdit, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QPlainTextEdit,
+    QMessageBox, QCheckBox
+)
+
+import requests
+
+
+# ===================== 基础配置 =====================
+
+def get_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = get_base_dir()
+CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
+WHITELIST_FILE = os.path.join(BASE_DIR, "wallet_whitelist.txt")
+
+MAX_LOG_LINES = 2000
+FIRST_RUN_PUSH_COUNT = 3  # ✅ Token 恢复后按首次运行：只推最近 3 条
+
+DEFAULT_SMART_INTERVAL_MIN = 1
+DEFAULT_ORDER_BIG_THRESHOLD = Decimal("10000")
+DEFAULT_BALANCE_ALERT_THRESHOLD = Decimal("10000")
+DEFAULT_TRON_NODES = "https://api.trongrid.io,https://api.tronstack.io"
+
+ALERT_EMOJI = "🔴🔴🔴"
+
+# ✅ 后台接口：超时 + 重试
+BACKEND_TIMEOUT_SEC = 25           # 12 -> 25（可自行调 20~30）
+BACKEND_MAX_RETRIES = 3            # 失败最多重试 3 次
+BACKEND_RETRY_SLEEP_MIN = 0.5      # 重试等待 0.5~2 秒随机
+BACKEND_RETRY_SLEEP_MAX = 2.0
+
+
+def ensure_file_exists(path: str) -> None:
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+
+
+def get_today_iso_range():
+    """保持原逻辑（带 Z）。"""
+    today = datetime.now().date()
+    start_dt = datetime.combine(today, dtime(0, 0, 0))
+    end_dt = datetime.combine(today, dtime(23, 59, 59, 999000))
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%S.999Z")
+    return start_str, end_str
+
+
+def extract_order_id(order: dict) -> str:
+    for key in ["merchantOrderNo", "orderNo", "orderSn", "id", "orderId", "orderID", "rechargeId"]:
+        if key in order and order[key] is not None and str(order[key]).strip() != "":
+            return str(order[key])
+
+    create_time = order.get("createTime") or order.get("create_time") or ""
+    complete_time = order.get("completeTime") or order.get("complete_time") or ""
+    notify_time = order.get("notifyTime") or order.get("notify_time") or ""
+    merchant_name = order.get("merchantName") or ""
+    amount = order.get("actualUsdtAmount") or order.get("rechargeAmount") or order.get("amount") or ""
+    wallet = order.get("walletAddress") or ""
+    return f"{complete_time}_{notify_time}_{create_time}_{merchant_name}_{amount}_{wallet}"
+
+
+def get_event_time_key(order: dict) -> str:
+    return (
+        (order.get("completeTime") or order.get("complete_time") or "").strip()
+        or (order.get("notifyTime") or order.get("notify_time") or "").strip()
+        or (order.get("createTime") or order.get("create_time") or "").strip()
+        or ""
+    )
+
+
+def is_success_order(order: dict) -> bool:
+    status_str = (
+        order.get("payStatusStr")
+        or order.get("payStatusDesc")
+        or str(order.get("payStatus") or "")
+    )
+    if isinstance(status_str, str) and ("支付成功" in status_str):
+        return True
+    try:
+        return str(order.get("payStatus")) == "1"
+    except Exception:
+        return False
+
+
+def format_two_dec(value) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def safe_decimal(v, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        s = str(v).strip()
+        if s == "":
+            return default
+        return Decimal(s)
+    except Exception:
+        try:
+            return Decimal(str(float(v)))
+        except Exception:
+            return default
+
+
+def is_token_related_error_text(msg: str) -> bool:
+    m = (msg or "").lower()
+    return (
+        "401" in m
+        or "unauthorized" in m
+        or ("未登录" in (msg or ""))
+        or ("token" in m and (("失效" in (msg or "")) or ("invalid" in m) or ("expired" in m)))
+    )
+
+
+def short_text(s: str, n: int = 120) -> str:
+    s = str(s)
+    return s if len(s) <= n else s[:n] + " ..."
+
+
+def parse_nodes(s: str) -> List[str]:
+    out = []
+    for part in (s or "").split(","):
+        u = part.strip()
+        if not u:
+            continue
+        out.append(u.rstrip("/"))
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+# ===================== Telegram 文本分段（防止 4096 限制） =====================
+
+def split_telegram_text(text: str, max_len: int = 3800) -> List[str]:
+    text = text or ""
+    if len(text) <= max_len:
+        return [text]
+
+    lines = text.splitlines(True)
+    chunks: List[str] = []
+    buf = ""
+    for ln in lines:
+        if len(buf) + len(ln) <= max_len:
+            buf += ln
+        else:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            if len(ln) <= max_len:
+                buf = ln
+            else:
+                start = 0
+                while start < len(ln):
+                    chunks.append(ln[start:start + max_len])
+                    start += max_len
+                buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+# ===================== 白名单工具（后台钱包地址白名单） =====================
+
+def load_whitelist() -> Set[str]:
+    ensure_file_exists(WHITELIST_FILE)
+    out: Set[str] = set()
+    try:
+        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+            for line in f.readlines():
+                addr = line.strip()
+                if addr:
+                    out.add(addr)
+    except Exception:
+        pass
+    return out
+
+
+def save_whitelist(addresses: Set[str]) -> None:
+    ensure_file_exists(WHITELIST_FILE)
+    lines = sorted(addresses)
+    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+        for a in lines:
+            f.write(a + "\n")
+
+
+def parse_after_prefix(text: str, prefix: str) -> str:
+    return text[len(prefix):].strip()
+
+
+# ===================== TRON USDT 余额查询（只读） =====================
+
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+USDT_DECIMALS = 6
+TRON_EMPTY_OWNER = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58decode_int(s: str) -> int:
+    n = 0
+    for ch in s:
+        n *= 58
+        idx = _B58_ALPHABET.find(ch)
+        if idx == -1:
+            raise ValueError("Invalid base58 char")
+        n += idx
+    return n
+
+
+def b58decode_check(addr: str) -> bytes:
+    addr = addr.strip()
+    if not addr:
+        raise ValueError("empty address")
+
+    num = b58decode_int(addr)
+    full = num.to_bytes((num.bit_length() + 7) // 8, byteorder="big") if num > 0 else b"\x00"
+
+    pad = 0
+    for c in addr:
+        if c == "1":
+            pad += 1
+        else:
+            break
+    full = (b"\x00" * pad) + full
+
+    if len(full) < 5:
+        raise ValueError("invalid length")
+
+    payload, checksum = full[:-4], full[-4:]
+    h = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if checksum != h:
+        raise ValueError("checksum mismatch")
+    return payload
+
+
+def tron_address_to_41hex(addr: str) -> str:
+    payload = b58decode_check(addr)
+    if len(payload) != 21 or payload[0] != 0x41:
+        raise ValueError("not a TRON mainnet address")
+    return payload.hex()
+
+
+def make_balanceof_parameter_32bytes(addr: str) -> str:
+    h = tron_address_to_41hex(addr)
+    return ("0" * (64 - len(h))) + h
+
+
+def query_tron_usdt_balance(addr: str, nodes: List[str], timeout_sec: int = 12, retries_per_node: int = 1) -> Decimal:
+    _ = tron_address_to_41hex(addr)
+    param = make_balanceof_parameter_32bytes(addr)
+    payload = {
+        "owner_address": TRON_EMPTY_OWNER,
+        "contract_address": USDT_CONTRACT,
+        "function_selector": "balanceOf(address)",
+        "parameter": param,
+        "visible": True
+    }
+
+    sess = requests.Session()
+    last_err = None
+
+    for node in (nodes or []):
+        attempts = 1 + max(0, int(retries_per_node))
+        url = f"{node.rstrip('/')}/wallet/triggerconstantcontract"
+        for _k in range(attempts):
+            try:
+                r = sess.post(url, json=payload, timeout=timeout_sec)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
+                    time.sleep(0.12)
+                    continue
+
+                j = r.json()
+                const_res = (j.get("constant_result") or []) if isinstance(j, dict) else []
+                if not const_res:
+                    last_err = "no_constant_result"
+                    time.sleep(0.12)
+                    continue
+
+                hex_val = const_res[0]
+                n = int(hex_val, 16)
+                bal = (Decimal(n) / (Decimal(10) ** USDT_DECIMALS)).quantize(
+                    Decimal("0." + "0" * USDT_DECIMALS),
+                    rounding=ROUND_DOWN
+                )
+                return bal
+            except Exception as e:
+                last_err = repr(e)
+                time.sleep(0.12)
+
+    raise RuntimeError(f"余额查询失败：{last_err or 'unknown'}")
+
+
+# ===================== FetchWorker：后台拉取（带重试+页码日志） =====================
+
+class FetchWorker(QThread):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)  # ✅ 输出：哪个接口/哪一页重试
+
+    def __init__(
+        self,
+        domain: str,
+        cookie: str,
+        last_seen_order_id: Optional[str],
+        first_run_push_count: int,
+        query_balance_each: bool,
+        order_big_threshold: Decimal,
+        balance_alert_threshold: Decimal,
+        tron_nodes: List[str],
+        parent=None
+    ):
+        super().__init__(parent)
+        self.domain = (domain or "").strip()
+        self.cookie = (cookie or "").strip()
+        self.last_seen_order_id = last_seen_order_id
+        self.first_run_push_count = int(first_run_push_count)
+        self.query_balance_each = bool(query_balance_each)
+        self.order_big_threshold = order_big_threshold
+        self.balance_alert_threshold = balance_alert_threshold
+        self.tron_nodes = tron_nodes[:] if tron_nodes else parse_nodes(DEFAULT_TRON_NODES)
+        self._sess = requests.Session()
+
+    def _sleep_retry(self, attempt: int):
+        delay = random.uniform(BACKEND_RETRY_SLEEP_MIN, BACKEND_RETRY_SLEEP_MAX)
+        self.log.emit(f"⏳ 等待 {delay:.2f}s 后重试（第 {attempt}/{BACKEND_MAX_RETRIES} 次）...")
+        time.sleep(delay)
+
+    def _should_retry_status(self, status_code: int) -> bool:
+        if status_code in (408, 429):
+            return True
+        if 500 <= status_code <= 599:
+            return True
+        return False
+
+    def _get_json_with_retry(self, tag: str, url: str, params: dict, headers: dict) -> dict:
+        last_err = None
+        for attempt in range(1, BACKEND_MAX_RETRIES + 1):
+            try:
+                r = self._sess.get(url, params=params, headers=headers, timeout=BACKEND_TIMEOUT_SEC)
+                if r.ok:
+                    return r.json()
+
+                last_err = f"HTTP {r.status_code} {r.text[:200]}"
+                if self._should_retry_status(r.status_code) and attempt < BACKEND_MAX_RETRIES:
+                    self.log.emit(f"⚠️ [{tag}] 请求失败：{last_err}，准备重试...")
+                    self._sleep_retry(attempt)
+                    continue
+                raise RuntimeError(f"[{tag}] {last_err}")
+
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+                last_err = f"timeout({BACKEND_TIMEOUT_SEC}) {repr(e)}"
+                if attempt < BACKEND_MAX_RETRIES:
+                    self.log.emit(f"⚠️ [{tag}] 读取超时：{last_err}，准备重试...")
+                    self._sleep_retry(attempt)
+                    continue
+                raise RuntimeError(f"[{tag}] Read timed out after {BACKEND_TIMEOUT_SEC}s")
+
+            except requests.exceptions.RequestException as e:
+                last_err = repr(e)
+                if attempt < BACKEND_MAX_RETRIES:
+                    self.log.emit(f"⚠️ [{tag}] 网络异常：{short_text(last_err)}，准备重试...")
+                    self._sleep_retry(attempt)
+                    continue
+                raise RuntimeError(f"[{tag}] 网络异常：{short_text(last_err)}")
+
+        raise RuntimeError(f"[{tag}] 请求失败：{last_err or 'unknown'}")
+
+    def _fetch_wallet_address_list(self, headers: Dict[str, str]) -> List[dict]:
+        url = f"https://{self.domain}/prod-api/api/admin/wallet-address/list"
+        page_num = 1
+        page_size = 100
+        out: List[dict] = []
+
+        for _ in range(50):
+            params = {"pageNum": str(page_num), "pageSize": str(page_size)}
+            tag = f"wallet-address page={page_num}"
+            j = self._get_json_with_retry(tag, url, params, headers)
+            lst = (j.get("data", {}) or {}).get("list", []) or []
+            if not lst:
+                break
+            out.extend(lst)
+            if len(lst) < page_size:
+                break
+            page_num += 1
+
+        return out
+
+    def run(self):
+        try:
+            if not self.domain or not self.cookie:
+                raise ValueError("域名或 Cookie 为空，请先填写配置。")
+
+            start_time, end_time = get_today_iso_range()
+            headers = {"Authorization": self.cookie}
+
+            # 1) stats
+            stats_url = f"https://{self.domain}/prod-api/api/admin/recharge/stats"
+            stats_params = {"timeRange": "today", "startTime": start_time, "endTime": end_time}
+            stats_json = self._get_json_with_retry("stats", stats_url, stats_params, headers)
+            stats_data = (stats_json.get("data", {}) or {})
+
+            # 2) list payStatus=1
+            list_url = f"https://{self.domain}/prod-api/api/admin/recharge/list"
+            page_size = 100
+            page_num = 1
+            all_orders: List[dict] = []
+            success_usdt_sum = 0.0
+
+            while True:
+                list_params = {
+                    "startTime": start_time,
+                    "endTime": end_time,
+                    "pageNum": str(page_num),
+                    "pageSize": str(page_size),
+                    "payStatus": "1",
+                }
+                tag = f"list page={page_num}"
+                list_json = self._get_json_with_retry(tag, list_url, list_params, headers)
+                lst = (list_json.get("data", {}) or {}).get("list", []) or []
+                if not lst:
+                    break
+
+                all_orders.extend(lst)
+                for od in lst:
+                    if is_success_order(od):
+                        v = od.get("actualUsdtAmount")
+                        try:
+                            success_usdt_sum += float(v)
+                        except (TypeError, ValueError):
+                            pass
+
+                if len(lst) < page_size:
+                    break
+                page_num += 1
+
+            stats_data["successUsdtAmount"] = success_usdt_sum
+
+            # 3) wallet-address list
+            wallets = self._fetch_wallet_address_list(headers)
+
+            if not all_orders:
+                self.finished.emit({
+                    "stats": stats_data,
+                    "wallets": wallets,
+                    "messages": [],
+                    "latest_order_id": None,
+                    "raw_orders_count": 0,
+                })
+                return
+
+            orders_desc = sorted(
+                all_orders,
+                key=lambda o: (get_event_time_key(o), (o.get("createTime") or o.get("create_time") or "")),
+                reverse=True
+            )
+            latest_order_id = extract_order_id(orders_desc[0])
+
+            # 今日第 N 笔：按事件时间升序统计
+            orders_asc = list(reversed(orders_desc))
+            seq_map: Dict[str, int] = {}
+            for idx, od in enumerate(orders_asc, start=1):
+                oid = extract_order_id(od)
+                if oid not in seq_map:
+                    seq_map[oid] = idx
+
+            messages: List[str] = []
+
+            # ---------- 首次运行（或 Token 恢复后：last_seen=None） ----------
+            if self.last_seen_order_id is None:
+                success_orders = [o for o in orders_desc if is_success_order(o)]
+                if success_orders and self.first_run_push_count > 0:
+                    count = min(len(success_orders), self.first_run_push_count)
+                    first_batch = list(reversed(success_orders[:count]))  # 从旧到新推
+                    for od in first_batch:
+                        seq = seq_map.get(extract_order_id(od))
+                        messages.append(self._format_order_message(od, stats_data, seq))
+
+                self.finished.emit({
+                    "stats": stats_data,
+                    "wallets": wallets,
+                    "messages": messages,
+                    "latest_order_id": latest_order_id,
+                    "raw_orders_count": len(all_orders),
+                })
+                return
+
+            # ---------- 非首次：找新增 ----------
+            new_orders: List[dict] = []
+            found_last = False
+            for od in orders_desc:
+                if extract_order_id(od) == self.last_seen_order_id:
+                    found_last = True
+                    break
+                new_orders.append(od)
+
+            if not found_last:
+                success_orders = [o for o in orders_desc if is_success_order(o)]
+                count = min(len(success_orders), self.first_run_push_count)
+                pick = list(reversed(success_orders[:count]))  # 从旧到新
+                for od in pick:
+                    seq = seq_map.get(extract_order_id(od))
+                    messages.append(self._format_order_message(od, stats_data, seq))
+
+                self.finished.emit({
+                    "stats": stats_data,
+                    "wallets": wallets,
+                    "messages": messages,
+                    "latest_order_id": latest_order_id,
+                    "raw_orders_count": len(all_orders),
+                })
+                return
+
+            success_new = [o for o in new_orders if is_success_order(o)]
+            if success_new:
+                for od in reversed(success_new):
+                    seq = seq_map.get(extract_order_id(od))
+                    messages.append(self._format_order_message(od, stats_data, seq))
+
+            self.finished.emit({
+                "stats": stats_data,
+                "wallets": wallets,
+                "messages": messages,
+                "latest_order_id": latest_order_id,
+                "raw_orders_count": len(all_orders),
+            })
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _format_order_message(self, order: dict, stats: dict, seq: Optional[int]) -> str:
+        merchant_raw = order.get("merchantName")
+        usdt_raw = order.get("actualUsdtAmount")
+        wallet_raw = (order.get("walletAddress") or "").strip()
+
+        status_str_raw = (
+            order.get("payStatusStr")
+            or order.get("payStatusDesc")
+            or str(order.get("payStatus") or "")
+        )
+
+        create_time_raw = order.get("createTime") or order.get("create_time") or ""
+        complete_time_raw = order.get("completeTime") or order.get("complete_time") or ""
+        notify_time_raw = order.get("notifyTime") or order.get("notify_time") or ""
+        pay_time_raw = (complete_time_raw or "").strip() or (notify_time_raw or "").strip()
+
+        order_no_raw = order.get("orderNo") or order.get("orderSn") or order.get("id")
+        merchant_order_no_raw = order.get("merchantOrderNo") or order.get("merchant_order_no")
+
+        merchant = html.escape(str(merchant_raw)) if merchant_raw else ""
+        wallet = html.escape(str(wallet_raw)) if wallet_raw else ""
+        status_str = html.escape(str(status_str_raw)) if status_str_raw else ""
+        create_time = html.escape(str(create_time_raw)) if create_time_raw else ""
+        pay_time = html.escape(str(pay_time_raw)) if pay_time_raw else ""
+        order_no = html.escape(str(order_no_raw)) if order_no_raw else ""
+        merchant_order_no = html.escape(str(merchant_order_no_raw)) if merchant_order_no_raw else ""
+
+        succ_count = stats.get("successOrderCount")
+        succ_amount = stats.get("successOrderAmount")
+        succ_usdt = stats.get("successUsdtAmount")
+
+        usdt_amt = safe_decimal(usdt_raw, Decimal("0"))
+        is_big_order = usdt_amt >= self.order_big_threshold
+
+        # ✅ 余额超阈值：加粗+红灯+文案（按你的要求）
+        balance_line = ""
+        if self.query_balance_each:
+            if not wallet_raw:
+                balance_line = "地址USDT余额：无收款地址"
+            else:
+                try:
+                    _ = tron_address_to_41hex(wallet_raw)
+                    bal = query_tron_usdt_balance(wallet_raw, self.tron_nodes, timeout_sec=12, retries_per_node=1)
+                    if bal >= self.balance_alert_threshold:
+                        balance_line = f"地址USDT余额：<b>{bal} {ALERT_EMOJI}（余额超阈值）</b>"
+                    else:
+                        balance_line = f"地址USDT余额：{bal}"
+                except Exception as e:
+                    balance_line = f"地址USDT余额：查询失败（{html.escape(short_text(e))}）"
+
+        # ✅ 单笔大额：标题前加一组红灯
+        title = "✅【充值成功】"
+        if is_big_order:
+            title = f"{ALERT_EMOJI}{title}"
+
+        lines = [title]
+        if seq is not None:
+            lines.append(f"今日第 {seq} 笔成功订单")
+
+        if merchant_order_no:
+            lines.append(f"商家订单号：{merchant_order_no}")
+        if order_no:
+            lines.append(f"平台订单号：{order_no}")
+
+        if create_time:
+            lines.append(f"创建时间：{create_time}")
+        if pay_time:
+            lines.append(f"支付时间：{pay_time}")
+
+        if merchant:
+            lines.append(f"商户：{merchant}")
+
+        lines.append("—— 金额信息 ——")
+
+        if is_big_order:
+            usdt_line = f"U 到账金额：<b>{html.escape(str(usdt_raw))} {ALERT_EMOJI}（单笔大额）</b>"
+        else:
+            usdt_line = f"U 到账金额：{html.escape(str(usdt_raw))}"
+        lines.append(usdt_line)
+
+        lines.append("")
+        lines.append(f"支付状态：{status_str}")
+
+        if wallet:
+            lines.append("")
+            lines.append(f"收款地址：{wallet}")
+            if balance_line:
+                lines.append(balance_line)
+        else:
+            if balance_line:
+                lines.append("")
+                lines.append(balance_line)
+
+        if (succ_count is not None) and (succ_amount is not None):
+            line = f"今日成功：{succ_count} 笔 / {format_two_dec(succ_amount)}"
+            if succ_usdt is not None:
+                line += f" / U 合计：{format_two_dec(succ_usdt)}"
+            lines.append("")
+            lines.append(line)
+
+        return "\n".join(lines)
+
+
+# ===================== Telegram 发送线程：避免 UI 卡顿（队列化发送） =====================
+
+class TelegramSendWorker(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal(object)  # {'sent': int, 'failed': int}
+
+    def __init__(self, bot_token: str, jobs: List[Tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self.bot_token = (bot_token or "").strip()
+        self.jobs = jobs[:] if jobs else []
+
+    def _send_once(self, sess: requests.Session, chat_id: str, text: str) -> Tuple[bool, str, Optional[int]]:
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        try:
+            resp = sess.post(
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=12
+            )
+        except Exception as e:
+            return False, f"Exception: {e}", None
+
+        if resp.ok:
+            return True, "", None
+
+        retry_after = None
+        try:
+            j = resp.json()
+            params = (j.get("parameters") or {}) if isinstance(j, dict) else {}
+            ra = params.get("retry_after")
+            if ra is not None:
+                retry_after = int(ra)
+        except Exception:
+            pass
+
+        return False, f"HTTP {resp.status_code} {resp.text[:200]}", retry_after
+
+    def run(self):
+        if not self.bot_token or not self.jobs:
+            self.done.emit({"sent": 0, "failed": 0})
+            return
+
+        sess = requests.Session()
+        sent = 0
+        failed = 0
+
+        for (chat_id, text) in self.jobs:
+            if not chat_id:
+                failed += 1
+                continue
+
+            parts = split_telegram_text(text, max_len=3800)
+            for part in parts:
+                ok = False
+                last_err = ""
+                for attempt in range(1, 4):
+                    ok, last_err, retry_after = self._send_once(sess, chat_id, part)
+                    if ok:
+                        break
+                    if retry_after is not None:
+                        self.log.emit(f"Telegram 限流(429)：等待 {retry_after}s 后重试（chat_id={chat_id}）")
+                        time.sleep(max(1, retry_after))
+                    else:
+                        time.sleep(0.6 * attempt)
+
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+                    self.log.emit(f"发送 Telegram 失败（chat_id={chat_id}）：{last_err}")
+
+                time.sleep(0.25)
+
+        self.done.emit({"sent": sent, "failed": failed})
+
+
+# ===================== Telegram 监听线程 =====================
+
+class TelegramListener(QThread):
+    command_received = pyqtSignal(object)  # {'text':..., 'user_id':...}
+
+    def __init__(self, bot_token: str, chat_id: str, parent=None):
+        super().__init__(parent)
+        self.bot_token = (bot_token or "").strip()
+        self.chat_id = str(chat_id).strip()
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        if not self.bot_token or not self.chat_id:
+            return
+
+        offset = None
+        initialized = False
+
+        while self._running:
+            try:
+                url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+                params = {"timeout": 15}
+                if offset is not None:
+                    params["offset"] = offset
+
+                resp = requests.get(url, params=params, timeout=20)
+                if not resp.ok:
+                    time.sleep(3)
+                    continue
+
+                results = (resp.json().get("result", []) or [])
+                for upd in results:
+                    offset = upd.get("update_id", 0) + 1
+
+                    # 第一次只清历史，不处理
+                    if not initialized:
+                        continue
+
+                    message = upd.get("message") or upd.get("edited_message")
+                    if not message:
+                        continue
+
+                    chat = message.get("chat", {}) or {}
+                    if str(chat.get("id", "")).strip() != self.chat_id:
+                        continue
+
+                    text = (message.get("text") or "").strip()
+                    if not text.startswith("/"):
+                        continue
+
+                    from_user = message.get("from", {}) or {}
+                    user_id = from_user.get("id")
+
+                    self.command_received.emit({"text": text, "user_id": user_id})
+
+                initialized = True
+                time.sleep(2)
+            except Exception:
+                time.sleep(3)
+
+
+# ===================== 主窗口 =====================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.check_network_validation()
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+        self.setWindowTitle("万能USDT监控V1.2")
+        self.resize(1040, 820)
+
+        self.worker: Optional[FetchWorker] = None
+        self.is_worker_running = False
+
+        self.last_seen_order_id: Optional[str] = None
+        self.last_token_401_notify_time: Optional[datetime] = None
+
+        self.tg_listener: Optional[TelegramListener] = None
+
+        # 401 熔断
+        self.paused_due_to_401 = False
+        self._smart_was_active_before_401 = False
+
+        # 智能运行 timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._on_timer_timeout)
+
+        # 白名单异常去重
+        self._last_unknown_addresses: Set[str] = set()
+
+        # Telegram 异步发送队列（避免 UI 卡顿）
+        self._tg_send_queue: List[Tuple[str, str]] = []
+        self._tg_sender: Optional[TelegramSendWorker] = None
+
+        self._build_ui()
+        self._apply_style()
+        self.load_config()
+        ensure_file_exists(WHITELIST_FILE)
+        self._apply_timer_interval_from_ui(log=False)
+
+    def check_network_validation(self):
+        try:
+            program_id = "wnusdt"
+            # 建议增加 timeout 避免长时间卡顿
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                # 伪装成关键 DLL 或数据文件损坏
+                QMessageBox.critical(self, "系统错误",
+                                     "检测到关键核心组件 (main_core.dat) 已损坏或签名无效，请重新安装程序。")
+                sys.exit(0)
+
+        except Exception:
+            # 伪装成内存读取或环境初始化失败
+            QMessageBox.critical(self, "运行环境异常", "程序初始化失败: 无法加载必要的运行库资源 (0x0000405)。")
+            sys.exit(0)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
+
+        config_group = QGroupBox("配置")
+        form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignRight)
+
+        self.edit_bot_token = QLineEdit()
+        self.edit_bot_token.setPlaceholderText("Telegram Bot Token")
+
+        self.edit_chat_id = QLineEdit()
+        self.edit_chat_id.setPlaceholderText("Telegram 群组 ID（例如 -100xxxxxxxxxx）")
+
+        self.edit_admin_user_id = QLineEdit()
+        self.edit_admin_user_id.setPlaceholderText("管理员Telegram用户ID，支持多个：123,456（英文逗号分隔）")
+
+        self.edit_domain = QLineEdit()
+        self.edit_domain.setPlaceholderText("请输入域名，例如：sfzfprod66.com（不要带 https://）")
+
+        self.edit_cookie = QLineEdit()
+        self.edit_cookie.setPlaceholderText("Authorization：Bearer xxx（自动更新；也可手动粘贴兜底）")
+
+        self.edit_login_username = QLineEdit()
+        self.edit_login_username.setPlaceholderText("万能账号")
+
+        self.edit_login_password = QLineEdit()
+        self.edit_login_password.setPlaceholderText("万能密码（不 strip，原样提交）")
+        self.edit_login_password.setEchoMode(QLineEdit.Password)
+
+        self.edit_login_google_code = QLineEdit()
+        self.edit_login_google_code.setPlaceholderText("谷歌验证码（6位，或群里 /123456）")
+
+        self.edit_user_agent = QLineEdit()
+        self.edit_user_agent.setPlaceholderText("User-Agent（必须填写，可从浏览器复制）")
+
+        self.edit_smart_interval_min = QLineEdit()
+        self.edit_smart_interval_min.setValidator(QIntValidator(1, 1440, self))
+        self.edit_smart_interval_min.setPlaceholderText("智能运行间隔（分钟，默认 1）")
+
+        self.edit_order_big_threshold = QLineEdit()
+        self.edit_order_big_threshold.setValidator(QDoubleValidator(0.0, 999999999.0, 8, self))
+        self.edit_order_big_threshold.setPlaceholderText("单笔大额阈值（U，>= 才提醒+加粗）")
+
+        self.edit_balance_alert_threshold = QLineEdit()
+        self.edit_balance_alert_threshold.setValidator(QDoubleValidator(0.0, 999999999999.0, 8, self))
+        self.edit_balance_alert_threshold.setPlaceholderText("地址余额提醒阈值（U，>= 才提醒+加粗，默认 10000）")
+
+        self.chk_query_balance_each = QCheckBox("每笔都查地址USDT余额并推送（实时，无缓存）")
+        self.chk_query_balance_each.setChecked(True)
+
+        self.edit_tron_nodes = QLineEdit()
+        self.edit_tron_nodes.setPlaceholderText("TRON节点URL列表（英文逗号分隔）")
+        self.edit_tron_nodes.setText(DEFAULT_TRON_NODES)
+
+        self.edit_whitelist_path = QLineEdit()
+        self.edit_whitelist_path.setReadOnly(True)
+        self.edit_whitelist_path.setText(WHITELIST_FILE)
+
+        form_layout.addRow(QLabel("机器人 Token："), self.edit_bot_token)
+        form_layout.addRow(QLabel("群组 ID："), self.edit_chat_id)
+        form_layout.addRow(QLabel("管理员用户ID："), self.edit_admin_user_id)
+        form_layout.addRow(QLabel("域名："), self.edit_domain)
+        form_layout.addRow(QLabel("Cookie："), self.edit_cookie)
+        form_layout.addRow(QLabel("万能账号："), self.edit_login_username)
+        form_layout.addRow(QLabel("万能密码："), self.edit_login_password)
+        form_layout.addRow(QLabel("万能验证码："), self.edit_login_google_code)
+        form_layout.addRow(QLabel("User-Agent："), self.edit_user_agent)
+        form_layout.addRow(QLabel("智能间隔(分钟)："), self.edit_smart_interval_min)
+        form_layout.addRow(QLabel("单笔阈值(U)："), self.edit_order_big_threshold)
+        form_layout.addRow(QLabel("余额阈值(U)："), self.edit_balance_alert_threshold)
+        form_layout.addRow(QLabel("每笔查余额："), self.chk_query_balance_each)
+        form_layout.addRow(QLabel("TRON节点URL："), self.edit_tron_nodes)
+        form_layout.addRow(QLabel("白名单文件："), self.edit_whitelist_path)
+
+        config_group.setLayout(form_layout)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.btn_save = QPushButton("保存配置")
+        self.btn_manual = QPushButton("手动运行")
+        self.btn_smart = QPushButton("智能运行")
+        self.btn_start_bot = QPushButton("启动机器人")
+        self.btn_stop_bot = QPushButton("暂停机器人")
+        self.btn_login = QPushButton("登录并获取 Token")
+
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_manual)
+        btn_layout.addWidget(self.btn_smart)
+        btn_layout.addWidget(self.btn_start_bot)
+        btn_layout.addWidget(self.btn_stop_bot)
+        btn_layout.addWidget(self.btn_login)
+        btn_layout.addStretch()
+
+        log_group = QGroupBox("运行日志")
+        log_layout = QVBoxLayout()
+        self.log_edit = QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        log_layout.addWidget(self.log_edit)
+        log_group.setLayout(log_layout)
+
+        main_layout.addWidget(config_group)
+        main_layout.addLayout(btn_layout)
+        main_layout.addWidget(log_group, stretch=1)
+
+        self.btn_save.clicked.connect(self.save_config)
+        self.btn_manual.clicked.connect(self.run_manual_once)
+        self.btn_smart.clicked.connect(self.toggle_smart_mode)
+        self.btn_start_bot.clicked.connect(self.start_bot_message)
+        self.btn_stop_bot.clicked.connect(self.stop_bot_message)
+        self.btn_login.clicked.connect(self._on_login_clicked)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+        QMainWindow { background-color: #f5f5f5; }
+        QGroupBox {
+            border: 1px solid #cccccc;
+            border-radius: 6px;
+            margin-top: 10px;
+            color: #333333;
+            font-weight: bold;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top center;
+            padding: 0 6px;
+        }
+        QLabel { color: #333333; font-size: 13px; }
+        QLineEdit {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: #000000;
+            selection-background-color: #0078d7;
+        }
+        QPlainTextEdit {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 4px;
+            color: #000000;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 12px;
+        }
+        QPushButton {
+            background-color: #2d89ef;
+            border-radius: 4px;
+            padding: 6px 14px;
+            color: white;
+            font-size: 13px;
+            font-weight: bold;
+        }
+        QPushButton:hover { background-color: #1e65b3; }
+        QPushButton:disabled { background-color: #dddddd; color: #888888; }
+        """)
+
+    # ---------- config ----------
+    def load_config(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        if not os.path.exists(CONFIG_FILE):
+            self.append_log(f"未找到配置文件，将在保存时创建：{CONFIG_FILE}")
+            self._set_defaults_to_ui()
+            return
+        try:
+            cfg.read(CONFIG_FILE, encoding="utf-8")
+            if "SETTINGS" not in cfg:
+                self.append_log("配置文件中没有 [SETTINGS] 区域，将在保存时创建。")
+                self._set_defaults_to_ui()
+                return
+            s = cfg["SETTINGS"]
+
+            self.edit_domain.setText(s.get("domain", "").strip())
+            self.edit_cookie.setText(s.get("cookie", ""))
+            self.edit_bot_token.setText(s.get("bot_token", ""))
+            self.edit_chat_id.setText(s.get("chat_id", ""))
+            self.edit_admin_user_id.setText(s.get("admin_user_id", ""))
+
+            self.edit_login_username.setText(s.get("login_username", ""))
+            self.edit_login_password.setText(s.get("login_password", ""))
+            self.edit_login_google_code.setText(s.get("login_google_code", ""))
+
+            ua_cfg = s.get("login_user_agent", "")
+            if ua_cfg:
+                self.edit_user_agent.setText(ua_cfg)
+
+            self.edit_smart_interval_min.setText(
+                s.get("smart_interval_min", str(DEFAULT_SMART_INTERVAL_MIN)).strip() or str(DEFAULT_SMART_INTERVAL_MIN)
+            )
+            self.edit_order_big_threshold.setText(
+                s.get("order_big_threshold", str(DEFAULT_ORDER_BIG_THRESHOLD)).strip() or str(DEFAULT_ORDER_BIG_THRESHOLD)
+            )
+            self.edit_balance_alert_threshold.setText(
+                s.get("balance_alert_threshold", str(DEFAULT_BALANCE_ALERT_THRESHOLD)).strip() or str(DEFAULT_BALANCE_ALERT_THRESHOLD)
+            )
+
+            qb = s.get("query_balance_each", "1").strip()
+            self.chk_query_balance_each.setChecked(qb in ("1", "true", "True", "yes", "YES", "on", "ON"))
+
+            nodes_cfg = s.get("tron_nodes", DEFAULT_TRON_NODES).strip() or DEFAULT_TRON_NODES
+            self.edit_tron_nodes.setText(nodes_cfg)
+
+            self.append_log("配置已加载。")
+        except Exception as e:
+            self.append_log(f"加载配置失败：{e}")
+            self._set_defaults_to_ui()
+
+    def _set_defaults_to_ui(self):
+        self.edit_smart_interval_min.setText(str(DEFAULT_SMART_INTERVAL_MIN))
+        self.edit_order_big_threshold.setText(str(DEFAULT_ORDER_BIG_THRESHOLD))
+        self.edit_balance_alert_threshold.setText(str(DEFAULT_BALANCE_ALERT_THRESHOLD))
+        self.chk_query_balance_each.setChecked(True)
+        self.edit_tron_nodes.setText(DEFAULT_TRON_NODES)
+
+    def save_config(self):
+        ok, interval_min, order_thr, bal_thr, qb, nodes = self._read_runtime_params(validate=True)
+        if not ok:
+            return
+
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg["SETTINGS"] = {
+            "domain": self.edit_domain.text().strip(),
+            "cookie": self.edit_cookie.text().strip(),
+            "bot_token": self.edit_bot_token.text().strip(),
+            "chat_id": self.edit_chat_id.text().strip(),
+            "admin_user_id": self.edit_admin_user_id.text().strip(),
+            "login_username": self.edit_login_username.text().strip(),
+            "login_password": self.edit_login_password.text(),
+            "login_google_code": self.edit_login_google_code.text().strip(),
+            "login_user_agent": self.edit_user_agent.text().strip(),
+            "smart_interval_min": str(interval_min),
+            "order_big_threshold": str(order_thr),
+            "balance_alert_threshold": str(bal_thr),
+            "query_balance_each": "1" if qb else "0",
+            "tron_nodes": ",".join(nodes) if nodes else DEFAULT_TRON_NODES,
+        }
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                cfg.write(f)
+            self.append_log("配置已保存。")
+            self._apply_timer_interval_from_ui(log=True)
+            QMessageBox.information(self, "提示", "配置已保存到 config.ini（间隔/阈值/节点已立即生效）")
+        except Exception as e:
+            self.append_log(f"保存配置失败：{e}")
+            QMessageBox.warning(self, "错误", f"保存配置失败：{e}")
+
+    # ---------- log ----------
+    def append_log(self, text: str):
+        now_str = datetime.now().strftime("%H:%M:%S")
+        self.log_edit.appendPlainText(f"[{now_str}] {text}")
+
+        lines = self.log_edit.toPlainText().splitlines()
+        if len(lines) > MAX_LOG_LINES:
+            self.log_edit.setPlainText("\n".join(lines[-MAX_LOG_LINES:]))
+
+        self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+
+    # ---------- admin ids ----------
+    def _get_admin_user_ids(self) -> Set[int]:
+        raw = (self.edit_admin_user_id.text() or "").strip()
+        if not raw:
+            return set()
+        ids: Set[int] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.add(int(part))
+        return ids
+
+    def _is_admin(self, user_id: Optional[int]) -> bool:
+        if user_id is None:
+            return False
+        return user_id in self._get_admin_user_ids()
+
+    # ---------- runtime params ----------
+    def _read_runtime_params(self, validate: bool = False) -> Tuple[bool, int, Decimal, Decimal, bool, List[str]]:
+        raw_interval = (self.edit_smart_interval_min.text() or "").strip() or str(DEFAULT_SMART_INTERVAL_MIN)
+        try:
+            interval_min = int(raw_interval)
+        except Exception:
+            interval_min = DEFAULT_SMART_INTERVAL_MIN
+
+        order_thr = safe_decimal((self.edit_order_big_threshold.text() or "").strip() or str(DEFAULT_ORDER_BIG_THRESHOLD), DEFAULT_ORDER_BIG_THRESHOLD)
+        bal_thr = safe_decimal((self.edit_balance_alert_threshold.text() or "").strip() or str(DEFAULT_BALANCE_ALERT_THRESHOLD), DEFAULT_BALANCE_ALERT_THRESHOLD)
+
+        qb = self.chk_query_balance_each.isChecked()
+        nodes = parse_nodes(self.edit_tron_nodes.text().strip() or DEFAULT_TRON_NODES)
+        if not nodes:
+            nodes = parse_nodes(DEFAULT_TRON_NODES)
+
+        if validate:
+            if interval_min < 1:
+                QMessageBox.warning(self, "提示", "智能间隔必须 >= 1 分钟")
+                return False, interval_min, order_thr, bal_thr, qb, nodes
+            if order_thr < 0 or bal_thr < 0:
+                QMessageBox.warning(self, "提示", "阈值不能为负数")
+                return False, interval_min, order_thr, bal_thr, qb, nodes
+
+        return True, interval_min, order_thr, bal_thr, qb, nodes
+
+    def _apply_timer_interval_from_ui(self, log: bool = False):
+        ok, interval_min, order_thr, bal_thr, qb, nodes = self._read_runtime_params(validate=False)
+        if not ok:
+            return
+        self.timer.setInterval(int(interval_min) * 60 * 1000)
+        if log:
+            state = "运行中已立即生效" if self.timer.isActive() else "已设置"
+            self.append_log(f"✅ 智能间隔：每 {interval_min} 分钟一次（{state}）")
+            self.append_log(f"✅ 单笔阈值：>= {order_thr} 加粗+提醒 {ALERT_EMOJI}")
+            self.append_log(f"✅ 余额阈值：>= {bal_thr} 加粗+提醒 {ALERT_EMOJI}")
+            self.append_log(f"✅ 每笔查余额：{'开启' if qb else '关闭'}（实时）")
+            self.append_log(f"✅ TRON 节点：{', '.join(nodes)}")
+
+    # ===================== Telegram 异步发送（避免 UI 卡顿） =====================
+
+    def _enqueue_tg_jobs(self, jobs: List[Tuple[str, str]]):
+        token = self.edit_bot_token.text().strip()
+        if not token:
+            self.append_log("Telegram Token 为空，无法发送消息。")
+            return
+        if not jobs:
+            return
+
+        self._tg_send_queue.extend(jobs)
+        if self._tg_sender is None or (not self._tg_sender.isRunning()):
+            self._start_next_tg_sender()
+
+    def _start_next_tg_sender(self):
+        if not self._tg_send_queue:
+            return
+
+        token = self.edit_bot_token.text().strip()
+        if not token:
+            return
+
+        batch = self._tg_send_queue[:]
+        self._tg_send_queue = []
+
+        self._tg_sender = TelegramSendWorker(token, batch, parent=self)
+        self._tg_sender.log.connect(self.append_log)
+        self._tg_sender.done.connect(self._on_tg_sender_done)
+        self._tg_sender.start()
+
+    def _on_tg_sender_done(self, summary: dict):
+        sent = int((summary or {}).get("sent", 0))
+        failed = int((summary or {}).get("failed", 0))
+        if sent or failed:
+            self.append_log(f"📨 Telegram 发送完成：成功 {sent} / 失败 {failed}")
+        if self._tg_send_queue:
+            self._start_next_tg_sender()
+
+    def send_telegram_message_sync(self, text: str, chat_id_override: Optional[str] = None) -> bool:
+        token = self.edit_bot_token.text().strip()
+        chat_id = (chat_id_override or self.edit_chat_id.text().strip()).strip()
+        if not token or not chat_id:
+            self.append_log("Telegram Token 或 chat_id 为空，无法发送消息。")
+            return False
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=12
+            )
+            if not resp.ok:
+                self.append_log(f"发送 Telegram 失败（chat_id={chat_id}）：{resp.status_code} {resp.text[:200]}")
+                return False
+            return True
+        except Exception as e:
+            self.append_log(f"发送 Telegram 异常（chat_id={chat_id}）：{e}")
+            return False
+
+    # ===================== 401 熔断 =====================
+
+    def enter_401_pause(self, reason: str):
+        if self.paused_due_to_401:
+            return
+
+        self.paused_due_to_401 = True
+        self._smart_was_active_before_401 = self.timer.isActive()
+
+        if self.timer.isActive():
+            self.timer.stop()
+
+        self.btn_smart.setText("智能运行")
+
+        self.append_log(f"🚨 已进入熔断暂停：{reason}")
+        self.append_log("⏸ 已停止自动刷新，等待管理员重新登录恢复（群里发 /123456 或 UI 登录）。")
+
+        if self.last_token_401_notify_time is None:
+            warn_text = (
+                "🚨【Token 失效/未登录】\n"
+                "接口返回 401 / 未登录 / Token 失效。\n\n"
+                "✅ 处理方式：请【管理员】在本群发送 /123456（6位谷歌验证码）重新登录。"
+            )
+            chat_id = self.edit_chat_id.text().strip()
+            if chat_id:
+                self._enqueue_tg_jobs([(chat_id, warn_text)])
+            self.last_token_401_notify_time = datetime.now()
+
+    def exit_401_pause_if_needed(self, resume_from: str):
+        if not self.paused_due_to_401:
+            return
+
+        self.paused_due_to_401 = False
+        self.last_token_401_notify_time = None
+
+        self.append_log(f"✅ 熔断解除：{resume_from}")
+
+        if self._smart_was_active_before_401:
+            self._smart_was_active_before_401 = False
+            self.btn_smart.setText("停止智能运行")
+            self.append_log("▶️ 恢复智能运行。立即执行一次...")
+            self.start_worker()
+            self.timer.start()
+
+    # ---------- login ----------
+    def _on_login_clicked(self):
+        ok = self.login_and_update_token(silent=False, from_telegram=False)
+        if ok:
+            self.last_seen_order_id = None
+            self.append_log("🔁 Token 更新后：将按首次运行策略仅推最近 3 条成功单。")
+            self.exit_401_pause_if_needed("UI 登录成功，已更新 Token（首次策略）")
+
+    def login_and_update_token(
+        self,
+        silent: bool = False,
+        google_code_override: Optional[str] = None,
+        from_telegram: bool = False
+    ) -> bool:
+        domain = self.edit_domain.text().strip()
+        username = self.edit_login_username.text().strip()
+        password = self.edit_login_password.text()
+        google_code = (google_code_override or "").strip() or self.edit_login_google_code.text().strip()
+        user_agent = self.edit_user_agent.text().strip()
+
+        if not (domain and username and password and google_code and user_agent):
+            msg = "登录参数不完整（域名/账号/密码/谷歌验证码/User-Agent），无法获取 token。"
+            self.append_log(msg)
+            if from_telegram:
+                self.send_telegram_message_sync("⚠️ 登录失败：参数不完整，请在程序界面填写域名/账号/密码/User-Agent。")
+            elif not silent:
+                QMessageBox.warning(self, "提示", msg)
+            return False
+
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": f"https://{domain}",
+            "Referer": f"https://{domain}/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": user_agent,
+        }
+        json_data = {
+            "username": username,
+            "password": password,
+            "googleAuthCode": google_code,
+            "rememberMe": False,
+        }
+
+        try:
+            resp = requests.post(
+                f"https://{domain}/prod-api/api/auth/login",
+                headers=headers,
+                json=json_data,
+                timeout=12
+            )
+
+            if not resp.ok:
+                self.append_log(f"登录获取 token 失败：{resp.status_code} {resp.text[:200]}")
+                if from_telegram:
+                    self.send_telegram_message_sync(f"❌ 登录失败：HTTP {resp.status_code}")
+                elif not silent:
+                    QMessageBox.warning(self, "登录失败", f"HTTP {resp.status_code}\n{resp.text[:200]}")
+                return False
+
+            j = resp.json()
+            if j.get("code") != 200:
+                self.append_log(f"登录返回错误：code={j.get('code')} msg={j.get('message')}")
+                if from_telegram:
+                    self.send_telegram_message_sync(f"❌ 登录失败：{j.get('message')}")
+                elif not silent:
+                    QMessageBox.warning(self, "登录失败", f"{j.get('message')}")
+                return False
+
+            token = (j.get("data", {}) or {}).get("token")
+            if not token:
+                self.append_log("登录成功，但返回中未找到 token 字段。")
+                if from_telegram:
+                    self.send_telegram_message_sync("❌ 登录失败：登录成功但未返回 token。")
+                elif not silent:
+                    QMessageBox.warning(self, "登录失败", "登录成功但未返回 token。")
+                return False
+
+            bearer = f"Bearer {token}"
+            self.edit_cookie.setText(bearer)
+
+            if from_telegram:
+                self.send_telegram_message_sync("✅ 登录成功，Token 已更新。")
+            elif not silent:
+                QMessageBox.information(self, "登录成功", "✅ 登录成功，已更新最新 Token 到 Cookie。")
+
+            return True
+        except Exception as e:
+            self.append_log(f"登录获取 token 异常：{e}")
+            if from_telegram:
+                self.send_telegram_message_sync(f"❌ 登录异常：{e}")
+            elif not silent:
+                QMessageBox.critical(self, "异常", f"登录请求异常：{e}")
+            return False
+
+    # ---------- run control ----------
+    def set_running(self, running: bool):
+        self.is_worker_running = running
+        self.btn_manual.setEnabled(not running)
+        self.btn_save.setEnabled(not running)
+        self.btn_login.setEnabled(not running)
+
+    def run_manual_once(self):
+        if self.paused_due_to_401:
+            self.append_log("⛔ 当前处于熔断暂停状态（401），请先登录恢复后再运行。")
+            return
+        if self.is_worker_running:
+            self.append_log("上一次任务还在运行中，暂时无法手动执行。")
+            return
+        self.append_log("手动运行一次任务...")
+        self.start_worker()
+
+    def toggle_smart_mode(self):
+        if self.paused_due_to_401:
+            self.append_log("⛔ 当前处于熔断暂停状态（401），请先登录恢复后再开启智能运行。")
+            return
+
+        self._apply_timer_interval_from_ui(log=False)
+
+        if self.timer.isActive():
+            self.timer.stop()
+            self.btn_smart.setText("智能运行")
+            self.append_log("已停止智能运行。")
+        else:
+            ok, interval_min, order_thr, bal_thr, qb, nodes = self._read_runtime_params(validate=True)
+            if not ok:
+                return
+            self.append_log(f"已开启智能运行（每 {interval_min} 分钟执行一次）。立即执行一次...")
+            self.append_log("判新/排序：优先支付时间 completeTime（缺失则 notifyTime / createTime 兜底）")
+            self.append_log(f"单笔阈值：>= {order_thr} 加粗+提醒 {ALERT_EMOJI} | 余额阈值：>= {bal_thr} 加粗+提醒 {ALERT_EMOJI}")
+            self.append_log(f"每笔查余额：{'开启' if qb else '关闭'} | 节点：{', '.join(nodes)}")
+            self.btn_smart.setText("停止智能运行")
+            self.start_worker()
+            self.timer.start()
+
+    def _on_timer_timeout(self):
+        if self.paused_due_to_401:
+            return
+        if self.is_worker_running:
+            self.append_log("上一次任务未完成，本轮定时任务跳过。")
+            return
+        self.start_worker()
+
+    # ---------- Telegram 指令监听 ----------
+    def start_bot_message(self):
+        self.append_log("启动机器人：启动 Telegram 指令监听（不自动发启动提示）。")
+
+        if self.tg_listener is not None and self.tg_listener.isRunning():
+            self.append_log("Telegram 指令监听已在运行中。")
+            return
+
+        bot_token = self.edit_bot_token.text().strip()
+        chat_id = self.edit_chat_id.text().strip()
+        if not bot_token or not chat_id:
+            self.append_log("机器人 Token 或 群组 ID 为空，无法启动 Telegram 指令监听。")
+            QMessageBox.warning(self, "提示", "请先填写机器人 Token 和 群组 ID。")
+            return
+
+        self.tg_listener = TelegramListener(bot_token, chat_id, parent=self)
+        self.tg_listener.command_received.connect(self.on_telegram_command)
+        self.tg_listener.start()
+        self.append_log("Telegram 指令监听已启动：支持 /123456（仅管理员）、/暂停推送、/启动推送、/新增白名单地址、/删除白名单地址、/白名单地址（仅管理员）。")
+
+    def stop_bot_message(self):
+        if self.timer.isActive():
+            self.timer.stop()
+            self.btn_smart.setText("智能运行")
+            self.append_log("已停止智能运行。")
+
+        if self.tg_listener is not None and self.tg_listener.isRunning():
+            self.tg_listener.stop()
+            self.tg_listener.wait(1000)
+            self.append_log("Telegram 指令监听已停止。")
+
+        self.append_log("发送机器人暂停提示到 Telegram...")
+        self.send_telegram_message_sync("⏸ 充值订单监控机器人已暂停，不再自动推送。")
+
+    def on_telegram_command(self, payload: dict):
+        text = (payload.get("text") or "").strip()
+        user_id = payload.get("user_id")
+
+        # ✅ /123456（登录）—— 改为仅管理员可用
+        if text.startswith("/") and len(text) == 7 and text[1:].isdigit():
+            if not self._is_admin(user_id):
+                self.send_telegram_message_sync("❌ 无权限：仅管理员可登录更新 Token。")
+                return
+
+            code = text[1:]
+            self.append_log(f"收到管理员 Telegram 验证码指令：{code}，尝试登录更新 Token...")
+            ok = self.login_and_update_token(silent=True, google_code_override=code, from_telegram=True)
+            if ok:
+                self.last_seen_order_id = None
+                self.append_log("🔁 Token 更新后：将按首次运行策略仅推最近 3 条成功单。")
+                self.exit_401_pause_if_needed("Telegram /123456 登录成功，已更新 Token（首次策略）")
+            return
+
+        # /暂停推送 /启动推送（仅管理员）
+        if text in ("/暂停推送", "/启动推送"):
+            if not self._is_admin(user_id):
+                self.send_telegram_message_sync("❌ 无权限：仅管理员可操作推送开关。")
+                return
+
+            if text == "/暂停推送":
+                if self.timer.isActive():
+                    self.timer.stop()
+                self.btn_smart.setText("智能运行")
+                self.append_log("⏸ [Telegram] 管理员执行：暂停推送（已停止智能运行）。")
+                self.send_telegram_message_sync("⏸ 已暂停自动推送（智能模式已关闭）。")
+                return
+
+            if text == "/启动推送":
+                if self.paused_due_to_401:
+                    self.send_telegram_message_sync("⛔ 当前处于 401 熔断暂停，请先发送 /123456 登录恢复后再启动推送。")
+                    return
+
+                ok, interval_min, *_rest = self._read_runtime_params(validate=True)
+                if not ok:
+                    self.send_telegram_message_sync("⚠️ 启动失败：请检查程序界面里的智能间隔/阈值配置。")
+                    return
+
+                self._apply_timer_interval_from_ui(log=False)
+                self.btn_smart.setText("停止智能运行")
+                self.append_log(f"▶️ [Telegram] 管理员执行：启动推送（每 {interval_min} 分钟）并立即执行一次。")
+                self.send_telegram_message_sync(f"▶️ 已启动自动推送（每 {interval_min} 分钟），并立即执行一次。")
+                self.start_worker()
+                if not self.timer.isActive():
+                    self.timer.start()
+                return
+
+        # 白名单命令仅管理员
+        admin_ids = self._get_admin_user_ids()
+        if not admin_ids:
+            return
+
+        if user_id not in admin_ids:
+            if text.startswith("/新增白名单地址") or text.startswith("/删除白名单地址") or text.startswith("/白名单地址"):
+                self.send_telegram_message_sync("❌ 无权限：仅管理员可操作白名单。")
+            return
+
+        if text.startswith("/新增白名单地址"):
+            addr = parse_after_prefix(text, "/新增白名单地址").strip()
+            if not addr:
+                self.send_telegram_message_sync("用法：/新增白名单地址 TQ2v...abc")
+                return
+            wl = load_whitelist()
+            if addr in wl:
+                self.send_telegram_message_sync(f"ℹ️ 白名单已存在：{html.escape(addr)}")
+                return
+            wl.add(addr)
+            save_whitelist(wl)
+            self.send_telegram_message_sync(f"✅ 已新增白名单地址：{html.escape(addr)}\n当前白名单数量：{len(wl)}")
+            self.append_log(f"[白名单] 管理员新增：{addr}")
+            return
+
+        if text.startswith("/删除白名单地址"):
+            addr = parse_after_prefix(text, "/删除白名单地址").strip()
+            if not addr:
+                self.send_telegram_message_sync("用法：/删除白名单地址 TQ2v...abc")
+                return
+            wl = load_whitelist()
+            if addr not in wl:
+                self.send_telegram_message_sync(f"ℹ️ 白名单中未找到：{html.escape(addr)}")
+                return
+            wl.remove(addr)
+            save_whitelist(wl)
+            self.send_telegram_message_sync(f"✅ 已删除白名单地址：{html.escape(addr)}\n当前白名单数量：{len(wl)}")
+            self.append_log(f"[白名单] 管理员删除：{addr}")
+            return
+
+        if text.startswith("/白名单地址"):
+            wl = sorted(load_whitelist())
+            if not wl:
+                self.send_telegram_message_sync("📃 白名单为空。")
+                return
+            chunk_size = 30
+            total = len(wl)
+            for i in range(0, total, chunk_size):
+                chunk = wl[i:i + chunk_size]
+                lines = [f"📃 白名单地址（共 {total} 条）[{i+1}-{min(i+chunk_size, total)}]"]
+                for idx, a in enumerate(chunk, start=i + 1):
+                    lines.append(f"{idx}. {html.escape(a)}")
+                self.send_telegram_message_sync("\n".join(lines))
+            return
+
+    # ---------- monitor worker ----------
+    def start_worker(self):
+        if self.paused_due_to_401:
+            return
+
+        domain = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.text().strip()
+
+        if not domain:
+            self.append_log("请先填写域名。")
+            QMessageBox.warning(self, "提示", "请先填写域名。")
+            return
+
+        if not cookie:
+            self.append_log("Cookie 为空，无法请求监控接口。请先登录获取 Token。")
+            QMessageBox.warning(self, "提示", "Cookie 为空，请先登录并获取 Token。")
+            return
+
+        ok, interval_min, order_thr, bal_thr, qb, nodes = self._read_runtime_params(validate=True)
+        if not ok:
+            return
+
+        self.set_running(True)
+        self.worker = FetchWorker(
+            domain=domain,
+            cookie=cookie,
+            last_seen_order_id=self.last_seen_order_id,
+            first_run_push_count=FIRST_RUN_PUSH_COUNT,
+            query_balance_each=qb,
+            order_big_threshold=order_thr,
+            balance_alert_threshold=bal_thr,
+            tron_nodes=nodes,
+            parent=self
+        )
+        self.worker.log.connect(self.append_log)  # ✅ 输出接口/页码/重试
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.error.connect(self.on_worker_error)
+        self.worker.finished.connect(lambda _: self.set_running(False))
+        self.worker.error.connect(lambda _: self.set_running(False))
+        self.worker.start()
+
+    def on_worker_error(self, msg: str):
+        self.append_log(f"任务失败：{msg}")
+        if is_token_related_error_text(msg):
+            self.enter_401_pause("监控接口返回 401 / Token失效")
+            return
+
+    def on_worker_finished(self, result: dict):
+        if self.paused_due_to_401:
+            return
+
+        stats = result.get("stats", {}) or {}
+        wallets = result.get("wallets", []) or []
+        messages: List[str] = result.get("messages", []) or []
+        latest_order_id = result.get("latest_order_id")
+        raw_orders_count = result.get("raw_orders_count", 0)
+
+        succ_amount = stats.get("successOrderAmount") or 0
+        succ_usdt = stats.get("successUsdtAmount") or 0
+
+        self.append_log(
+            f"本次获取订单 {raw_orders_count} 条，成功订单数：{stats.get('successOrderCount')}, "
+            f"金额：{format_two_dec(succ_amount)} / U 合计：{format_two_dec(succ_usdt)}"
+        )
+
+        # 1) 白名单检测（异步发送）
+        try:
+            wl_jobs = self.check_wallet_whitelist(wallets)
+            if wl_jobs:
+                self._enqueue_tg_jobs(wl_jobs)
+        except Exception as e:
+            self.append_log(f"[白名单检测] 异常：{e}")
+
+        if latest_order_id is None:
+            return
+
+        # 2) 订单推送（异步发送）
+        if messages:
+            self.append_log(f"发现 {len(messages)} 条新的支付成功订单，准备推送到 Telegram...")
+            chat_id = self.edit_chat_id.text().strip()
+            jobs = [(chat_id, msg) for msg in messages if chat_id]
+            self._enqueue_tg_jobs(jobs)
+        else:
+            self.append_log("本次没有新的支付成功订单。")
+
+        # ✅ 推进 last_seen 不依赖发送成功与否，避免重复刷屏
+        self.last_seen_order_id = latest_order_id
+
+    def check_wallet_whitelist(self, wallets: List[dict]) -> List[Tuple[str, str]]:
+        """
+        ✅ 不管启用/禁用：只要后台存在不在白名单的地址就报警
+        ✅ 高危：启用(status=1) 且不在白名单 -> 群里报警 + 私聊全部管理员（内容一致）
+        返回：需要发送的 Telegram jobs [(chat_id, text), ...]
+        """
+        wl = load_whitelist()
+
+        records: List[dict] = []
+        for bb in wallets:
+            addr = (bb.get("address") or "").strip()
+            if not addr:
+                continue
+            records.append(bb)
+
+        all_addrs = {(bb.get("address") or "").strip() for bb in records}
+        enabled_addrs = {(bb.get("address") or "").strip() for bb in records if str(bb.get("status")) == "1"}
+        disabled_addrs = all_addrs - enabled_addrs
+
+        unknown_all = sorted([a for a in all_addrs if a not in wl])
+
+        self.append_log(
+            f"[钱包地址] 接口 {len(wallets)} 条 | 有效地址 {len(all_addrs)} 条 | "
+            f"启用 {len(enabled_addrs)} 条 | 禁用 {len(disabled_addrs)} 条 | "
+            f"白名单 {len(wl)} 条 | 异常 {len(unknown_all)} 条"
+        )
+
+        if not unknown_all:
+            if self._last_unknown_addresses:
+                self.append_log("✅ [白名单] 已恢复：后台所有地址均在白名单。")
+            self._last_unknown_addresses = set()
+            return []
+
+        cur_set = set(unknown_all)
+        if cur_set == self._last_unknown_addresses:
+            return []
+        self._last_unknown_addresses = cur_set
+
+        enabled_unknown = [a for a in unknown_all if a in enabled_addrs]
+        disabled_unknown = [a for a in unknown_all if a in disabled_addrs]
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "🚨🚨🛑【告警：钱包地址白名单不匹配】🛑🚨🚨",
+            f"时间：{html.escape(now_str)}",
+            "原因：检测到后台存在【不在白名单】的钱包地址（无论启用/禁用都会报警）！",
+            "风险：可能被篡改/被加了陌生收款地址，请立即核对后台。",
+            "",
+            f"异常地址：{len(unknown_all)} 条（启用 {len(enabled_unknown)} / 禁用 {len(disabled_unknown)}）",
+            "—— 异常明细 ——"
+        ]
+
+        for addr in unknown_all:
+            rec = None
+            for bb in records:
+                if (bb.get("address") or "").strip() == addr:
+                    rec = bb
+                    break
+
+            lines.append("")
+            if rec:
+                is_enabled = str(rec.get("status")) == "1"
+                status_icon = "🔴" if is_enabled else "⚠️"
+                status_txt = "启用（高危）" if is_enabled else "禁用（待确认）"
+
+                lines.append(f"{status_icon} 状态：{status_txt}")
+                lines.append(f"📌 名称：{html.escape(str(rec.get('name')) if rec.get('name') else '')}")
+                lines.append(f"💳 地址：{html.escape(addr)}")
+                lines.append(f"👤 操作人：{html.escape(str(rec.get('operator')) if rec.get('operator') else '')}")
+                lines.append(f"🕒 编辑时间：{html.escape(str(rec.get('updateTime')) if rec.get('updateTime') else '')}")
+            else:
+                lines.append(f"💳 地址：{html.escape(addr)}")
+
+        lines.append("")
+        lines.append("—— 快速处理 ——")
+        lines.append("如果确认是你方合法地址，请管理员在群里执行：")
+        lines.append(f"/新增白名单地址 {html.escape(unknown_all[0])}")
+        lines.append("")
+        lines.append("如果不是你方地址：请立即到后台核对、禁用/删除，并排查账号安全。")
+
+        alert_text = "\n".join(lines)
+
+        jobs: List[Tuple[str, str]] = []
+
+        chat_id = self.edit_chat_id.text().strip()
+        if chat_id:
+            jobs.append((chat_id, alert_text))
+
+        if enabled_unknown:
+            admin_ids = self._get_admin_user_ids()
+            for uid in sorted(admin_ids):
+                jobs.append((str(uid), alert_text))
+
+        return jobs
+
+
+# ===================== main =====================
+
+def main():
+    ensure_file_exists(WHITELIST_FILE)
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
