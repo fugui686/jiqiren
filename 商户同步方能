@@ -1,1 +1,1529 @@
 
+import sys
+import time
+import re
+import urllib
+import threading
+import configparser
+import requests
+from functools import partial
+from bs4 import BeautifulSoup
+from PyQt5.QtGui import QPixmap, QIcon, QFont
+from PyQt5.QtCore import QTimer, QByteArray, Qt
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QTextEdit, QPushButton, QFormLayout, QMessageBox, QGroupBox, QStackedWidget,
+    QListWidget, QListWidgetItem
+)
+
+# 全合支付/汉庭/使用的是同一个商户后台
+# 太阳城/易通/兆锋/大家发/使用的是同一个商户后台
+
+# ========== 可选：关闭不必要的告警 ==========
+try:
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+CONFIG_FILE = 'config.ini'
+
+# === 智能模式触发频率（分钟） ===
+INTERVAL_MIN = 4  # 想每 N 分钟触发就填 N（例如 2 / 5 / 10）
+ALIGN_MINUTE = 0  # 偏移分钟（0=在 00,02,04…触发；1=在 01,03,05…触发）
+
+
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("方能费率同步")
+        self.resize(1050, 690)
+
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.fields = {}  # 统一管理所有输入控件
+        self.long_text_field = '方能_cookie'
+
+        self._build_ui()
+        self._load_config()
+
+        # 方能 Cookie 轮询线程（保持登录态）
+        self.polling_thread = threading.Thread(target=self._poll_and_check_cookie_loop, daemon=True)
+        self.polling_thread.start()
+
+    # ===================== UI 构建 =====================
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+
+        # 左侧导航
+        self.nav = QListWidget()
+        self.nav.setFixedWidth(190)
+        self.nav.addItem(QListWidgetItem("🏢 方能"))
+        self.nav.addItem(QListWidgetItem("🌈 天鸿"))
+        self.nav.addItem(QListWidgetItem("💠 全合"))
+        self.nav.addItem(QListWidgetItem("🌞 太阳城"))
+        self.nav.addItem(QListWidgetItem("🏨 汉庭"))
+        self.nav.addItem(QListWidgetItem("💎 尊享"))
+        self.nav.addItem(QListWidgetItem("🧭 易通"))
+        self.nav.addItem(QListWidgetItem("⚡ 兆锋"))
+        self.nav.addItem(QListWidgetItem("🏖️ 大家发"))
+        self.nav.addItem(QListWidgetItem("📘 关于"))
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+
+        # 右侧页面
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_page_fangneng())  # 0
+        self.pages.addWidget(self._build_page_tianhong())  # 1
+        self.pages.addWidget(self._build_page_quanhe())  # 2
+        self.pages.addWidget(self._build_page_suncity())  # 新增：太阳城页
+        self.pages.addWidget(self._build_page_hanting())  # 新增：汉庭页
+        self.pages.addWidget(self._build_page_xinzunxiang())  # 新增：尊享页
+        self.pages.addWidget(self._build_page_yitong())  # 新增：易通页
+        self.pages.addWidget(self._build_page_zhaofeng())  # 新增：兆锋页
+        self.pages.addWidget(self._build_page_dajiafa())  # 新增：大家发页
+        self.pages.addWidget(self._build_page_guanyu())  # 新增：大家发页
+
+        root.addWidget(self.nav)
+        root.addWidget(self.pages, 1)
+
+        # 默认选中第一页
+        self.nav.setCurrentRow(0)
+
+        # 智能模式定时器
+        self.smart_timer = QTimer()
+        self.smart_timer.timeout.connect(self._check_and_run_smart_mode)
+        self.smart_mode_enabled = False
+
+        # —— 颜色统一管理（可按需微调）——
+        NAV_BG = "#f3f4f6"  # 左侧导航浅灰（和你右侧现在的浅灰相近）
+        NAV_HOVER_BG = "#e8eaed"  # 悬停时稍深
+        # 选中时的左侧颜色，用于渐变起点
+        NAV_GRADIENT_START = "#f9d8d8"
+        # 选中时的右侧颜色，用于渐变终点 (使用白色或接近背景色)
+        NAV_GRADIENT_END = "#ffffff"
+        TEXT_DEFAULT = "#000000"  # 默认黑字
+        TEXT_SELECTED = "#d92020"  # 选中后红字
+
+        # 悬停生效需要开启鼠标跟踪
+        self.nav.setMouseTracking(True)
+
+        # 左侧导航样式
+        self.nav.setStyleSheet(f"""
+        QListWidget {{
+            background: {NAV_BG};
+            border: none;
+            outline: 0;
+        }}
+        QListWidget::item {{
+            height: 36px;
+            padding: 6px 12px;
+            color: {TEXT_DEFAULT};
+            border: none;
+        }}
+        QListWidget::item:hover {{
+            /* 使用渐变作为悬停效果 */
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                        stop:0 {NAV_HOVER_BG}, 
+                                        stop:1 {NAV_GRADIENT_END});
+        }}
+        /* 选中项的渐变背景 */
+        QListWidget::item:selected,
+        QListWidget::item:selected:active,
+        QListWidget::item:selected:!active {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                        stop:0 {NAV_GRADIENT_START}, 
+                                        stop:1 {NAV_GRADIENT_END});
+            color: {TEXT_SELECTED};
+        }}
+
+        /*（可选）滚动条更细一点，风格更简洁 */
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 8px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: #c7c9cc;
+            border-radius: 4px;
+            min-height: 20px;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        """)
+
+        self.pages.setStyleSheet("""
+        /* 右侧页面容器背景：白色 (你原来的样式) */
+        QStackedWidget { background: #ffffff; }
+
+        /* ================== 新增的按钮 (QPushButton) 样式 ================== */
+        QPushButton {
+            background-color: white;            /* 白色背景 */
+            color: #3498db;                     /* 蓝色文字 */
+            border: 1px solid #3498db;          /* 蓝色边框 */
+            border-radius: 8px;                 /* 圆角半径8px */
+            padding: 10px 16px;                 /* 内边距 */
+            font-size: 16px;                    /* 字体大小 */
+            font-weight: bold;                 /* 字体加粗 */
+            letter-spacing: 0.5px;              /* 字符间距 */
+        }
+
+        QPushButton:hover {
+            background-color: #ecf5fb;          /* 鼠标悬停时浅蓝背景（视觉反馈） */
+            color: #2980b9;                     /* 悬停时文字颜色稍微加深 */
+            border: 1px solid #2980b9;          /* 边框颜色也稍微加深 */
+        }
+
+        QPushButton:pressed {
+            background-color: #d6eaf8;          /* 按下时更深一点的浅蓝背景 */
+            /* 调整 padding 以模拟按压感 */
+            padding-left: 14px;                 
+            padding-top: 12px;
+        }
+
+        QPushButton:disabled {
+            background-color: #f0f0f0;          /* 禁用时背景灰色 */
+            color: #bdc3c7;                     /* 禁用时字体浅灰 */
+            border: 1px solid #ccc;             /* 边框变浅灰 */
+        }
+
+        /* ================== 新增的输入控件 (QLineEdit, QComboBox, QDateTimeEdit) 样式 ================== */
+        QLineEdit, QComboBox, QDateTimeEdit {
+            padding: 6px;                      /* 输入控件内边距（6px） */
+            border: 1px solid #ccc;            /* 边框颜色为浅灰色 */
+            border-radius: 5px;                /* 圆角（5px） */
+            font-size: 13px;                   /* 字体大小（20px） */
+        }
+
+        /* 焦点状态 (新增) - 当用户点击（获得焦点）时边框变为蓝色 */
+        QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus {
+        border: 1px solid #3498db;         /* 蓝色边框 */
+        /* 也可以增加一点阴影来强化效果 */
+        /* outline: none;  /* 某些系统可能需要这个来禁用默认焦点框 */
+        }
+
+        /* ================== 新增的组框 (QGroupBox) 样式 ================== */
+        QGroupBox {
+            border: 1px solid #aaa;  /* 组框边框颜色和宽度 */
+            border-radius: 8px;  /* 组框圆角 */
+            margin-top: 6px;  /* 组框顶部外边距，为标题腾出空间 */
+        }
+
+        QGroupBox::title {
+            subcontrol-origin: margin;  /* 组框标题基于边距定位 */
+            subcontrol-position: top center;  /* 组框标题居中 */
+            padding: 0 6px;  /* 组框标题内边距 */
+            font-size: 15px;  /* 组框标题字体大小 */
+            font-weight: bold;  /* 组框标题加粗 */
+        }
+        """)
+
+        from PyQt5.QtGui import QFont, QFontMetrics
+        font = QFont()
+        font.setPointSize(12)  # 用“点”而不是像素，DPI 适配更好
+        self.nav.setFont(font)
+
+        fm = QFontMetrics(font)
+        item_h = fm.height() + 12  # 给上下各留点 padding
+        self.nav.setStyleSheet(self.nav.styleSheet() + f"""
+        QListWidget::item {{ height: {item_h}px; }}
+        """)
+
+    def _on_nav_changed(self, idx: int):
+        self.pages.setCurrentIndex(idx)
+
+    # ========== Page 1：方能配置 ==========
+    def _build_page_fangneng(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_fn = QGroupBox("🏢 方能平台配置")
+        form_fn = QFormLayout()
+        for name in ['方能账号', '方能密码', '方能验证码', '方能域名', 'user-agent', '方能_cookie']:
+            label = QLabel(name)
+            widget = QTextEdit() if name == self.long_text_field else QLineEdit()
+
+            if name in ('方能密码',) and isinstance(widget, QLineEdit):
+                widget.setEchoMode(QLineEdit.Password)
+
+            if name == self.long_text_field:
+                widget.setFixedHeight(80)
+
+            form_fn.addRow(label, widget)
+            self.fields[name] = widget
+        group_fn.setLayout(form_fn)
+
+        group_tg = QGroupBox("🤖 Telegram 通知")
+        form_tg = QFormLayout()
+        for name in ['机器人Token', '群组ID']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_tg.addRow(label, widget)
+            self.fields[name] = widget
+        group_tg.setLayout(form_tg)
+
+        btn_row = QHBoxLayout()
+        btn_save = QPushButton("💾 保存配置")
+        btn_save.clicked.connect(self._save_config)
+
+        btn_run = QPushButton("🚀 手动运行")
+        btn_run.clicked.connect(self._run_all_sync_threaded)
+
+        # 启动智能模式按钮
+        self.btn_start_smart = QPushButton(f"🧠 启动智能模式")
+        self.btn_start_smart.clicked.connect(self._start_smart_mode)
+
+        # 停止智能模式按钮
+        self.btn_stop_smart = QPushButton("🛑 停止智能模式")
+        self.btn_stop_smart.clicked.connect(self._stop_smart_mode)
+        # 初始时，停止按钮应为禁用状态
+        self.btn_stop_smart.setEnabled(False)
+
+        btn_login = QPushButton("🔐 登录方能")
+        btn_login.clicked.connect(self._login_fangneng_and_update_cookie)
+
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_run)
+        btn_row.addWidget(self.btn_start_smart)
+        btn_row.addWidget(self.btn_stop_smart)
+        btn_row.addWidget(btn_login)
+        btn_row.addStretch()
+
+        main_layout.addWidget(group_fn)
+        main_layout.addWidget(group_tg)
+        main_layout.addLayout(btn_row)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 2：天鸿配置 ==========
+    def _build_page_tianhong(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_th = QGroupBox("🌈 天鸿平台设置")
+        form_th = QFormLayout()
+        for name in ['天鸿域名(port)', '天鸿cookie']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_th.addRow(label, widget)
+            self.fields[name] = widget
+        group_th.setLayout(form_th)
+
+        #  启用可设置标签
+        # tips = QLabel("说明：本页仅配置项。统一点击“方能配置”页的『保存配置』『运行程序』『智能模式』管理。")
+        # tips.setWordWrap(True)
+
+        main_layout.addWidget(group_th)
+        # main_layout.addWidget(tips)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 3：全合支付配置 ==========
+    def _build_page_quanhe(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_qh = QGroupBox("💠 全合支付设置")
+        form_qh = QFormLayout()
+        for name in ['全合域名(port)', '全合cookie']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_qh.addRow(label, widget)
+            self.fields[name] = widget
+        group_qh.setLayout(form_qh)
+
+        main_layout.addWidget(group_qh)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 4：太阳城支付配置 ==========
+    def _build_page_suncity(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_sc = QGroupBox("🌞 太阳城设置")
+        form_sc = QFormLayout()
+        for name in ['太阳城域名(port)', '太阳城access_token']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_sc.addRow(label, widget)
+            self.fields[name] = widget
+        group_sc.setLayout(form_sc)
+
+        main_layout.addWidget(group_sc)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 5：汉庭支付配置 ==========
+    def _build_page_hanting(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group_ht = QGroupBox("🏨 汉庭设置")
+        form_ht = QFormLayout()
+        for name in ['汉庭域名(port)', '汉庭cookie']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form_ht.addRow(label, widget)
+            self.fields[name] = widget
+        group_ht.setLayout(form_ht)
+
+        main_layout.addWidget(group_ht)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 6：尊享支付配置 ==========
+    def _build_page_xinzunxiang(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group = QGroupBox("💎 尊享设置")
+        form = QFormLayout()
+        for name in ['尊享域名(port)', '尊享itoken']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form.addRow(label, widget)
+            self.fields[name] = widget
+        group.setLayout(form)
+
+        main_layout.addWidget(group)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 7：易通支付配置 ==========
+    def _build_page_yitong(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group = QGroupBox("🧭 易通设置")
+        form = QFormLayout()
+        for name in ['易通域名(port)', '易通access_token']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form.addRow(label, widget)
+            self.fields[name] = widget
+        group.setLayout(form)
+
+        main_layout.addWidget(group)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 8：兆锋支付配置 ==========
+    def _build_page_zhaofeng(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group = QGroupBox("⚡ 兆锋设置")
+        form = QFormLayout()
+        for name in ['兆锋域名(port)', '兆锋access_token']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form.addRow(label, widget)
+            self.fields[name] = widget
+        group.setLayout(form)
+
+        main_layout.addWidget(group)
+        main_layout.addStretch()
+        return page
+
+    # ========== Page 8：大家发支付配置 ==========
+    def _build_page_dajiafa(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        group = QGroupBox("🏖️ 大家发设置")
+        form = QFormLayout()
+        for name in ['大家发域名(port)', '大家发access_token']:
+            label = QLabel(name)
+            widget = QLineEdit()
+            form.addRow(label, widget)
+            self.fields[name] = widget
+        group.setLayout(form)
+
+        main_layout.addWidget(group)
+        main_layout.addStretch()
+        return page
+
+        # ==================== 关于部分 ====================
+    def _build_page_guanyu(self) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+
+        # ==================== 顶部信息部分 ====================
+
+        # 标题：关于数据精灵
+        title = QLabel("关于本工具")
+        font_title = QFont()
+        font_title.setPointSize(18)
+        font_title.setBold(True)
+        title.setFont(font_title)
+        main_layout.addWidget(title)
+
+        # 添加一个小的分隔
+        main_layout.addSpacing(20)
+
+        # 版本信息和更新日期
+        version_info = QLabel(
+            "版本：<span style='color: #d92020; font-weight: bold;'>v1.0.0</span> 更新日期：2025-10-16")
+        font_version = QFont()
+        font_version.setPointSize(12)
+        version_info.setFont(font_version)
+        # 使用 setOpenExternalLinks(True) 允许 HTML 链接，但这里主要用它来解析 <span> 标签的样式
+        version_info.setTextFormat(Qt.TextFormat.RichText)
+        main_layout.addWidget(version_info)
+
+        # 添加一个小的分隔
+        main_layout.addSpacing(20)
+
+        # ==================== 声明部分 ====================
+
+        # 声明标题
+        declaration_title = QLabel("声明:")
+        font_declaration_title = QFont()
+        font_declaration_title.setPointSize(14)
+        font_declaration_title.setBold(True)
+        declaration_title.setFont(font_declaration_title)
+        main_layout.addWidget(declaration_title)
+
+        # 声明正文 - 第一段
+        declaration_text_1 = """
+        本软件仅供具备后台访问权限且已获授权的用户在合规前提下使用，主要用于同步三商户方费率到方能支付后台。使用者应确认/保证数据与账号来源合规、授权充分，并对自身操作及结果承担全部责任。
+        """
+        declaration_label_1 = QLabel(declaration_text_1.strip())
+        declaration_label_1.setWordWrap(True)
+        declaration_label_1.setFont(QFont("微软雅黑", 12))  # 保持字体和大小一致
+        main_layout.addWidget(declaration_label_1)
+
+        # 声明正文 - 第二段
+        declaration_text_2 = """
+        因授权不足或违规导致的任何损失、处罚等由使用者自行承担。本软件按“现状”提供，不作任何明示或默示担保；作者对因使用或无法使用本软件造成的任何直接或间接损失不承担责任。本软件与相关平台/商户/支付机构无隶属或合作关系。
+        """
+        declaration_label_2 = QLabel(declaration_text_2.strip())
+        declaration_label_2.setWordWrap(True)
+        declaration_label_2.setFont(QFont("微软雅黑", 12))
+        main_layout.addWidget(declaration_label_2)
+
+        # 声明正文 - 第三段
+        declaration_text_3 = """
+        继续使用即表示您已阅读、理解并同意本声明。
+        """
+        declaration_label_3 = QLabel(declaration_text_3.strip())
+        declaration_label_3.setWordWrap(True)
+        declaration_label_3.setFont(QFont("微软雅黑", 12))
+        main_layout.addWidget(declaration_label_3)
+
+        # ==================== 结束布局 ====================
+
+        # 添加伸展器，将内容推到顶部
+        main_layout.addStretch()
+
+        # 设置页面背景色为白色，与右侧页面容器背景色保持一致（如果父容器没有全局设置的话）
+        # page.setStyleSheet("background-color: white;")
+
+        return page
+
+    # ===================== 智能模式 =====================
+    def _start_smart_mode(self):
+        """
+        启动智能模式，设置定时器并更新按钮状态。
+        """
+        # 状态更新
+        self.smart_mode_enabled = True
+
+        # 按钮状态更新
+        self.btn_start_smart.setEnabled(False)  # 启动后禁用启动按钮
+        self.btn_stop_smart.setEnabled(True)  # 启动后启用停止按钮
+
+        # 定时器启动
+        # 注意：self.smart_timer 应该是 QTimer 的实例
+        self.smart_timer.start(10_000)  # 每 10 秒检查一次是否到触发窗口
+
+        # 提示信息
+        QMessageBox.information(self, "智能模式", f"✅ 智能模式已启动，将每 {INTERVAL_MIN} 分钟执行一次。")
+
+    def _stop_smart_mode(self):
+        """
+        停止智能模式，停止定时器并更新按钮状态。
+        """
+        # 状态更新
+        self.smart_mode_enabled = False
+
+        # 按钮状态更新
+        self.btn_start_smart.setEnabled(True)  # 停止后启用启动按钮
+        self.btn_stop_smart.setEnabled(False)  # 停止后禁用停止按钮
+
+        # 定时器停止
+        self.smart_timer.stop()
+
+        # 提示信息
+        QMessageBox.information(self, "智能模式", "⛔️ 智能模式已停止。")
+
+    def _check_and_run_smart_mode(self):
+        now = time.localtime()
+        if (now.tm_min - ALIGN_MINUTE) % INTERVAL_MIN == 0 and now.tm_sec < 10:
+            print("⏰ 智能模式触发，开始运行程序（统一同步：天鸿/全合 → 方能）...")
+            self._run_all_sync_threaded()
+
+    # ============== 方能 Cookie 自动维护（保持登录态） ==============
+    def _poll_and_check_cookie_loop(self):
+        while True:
+            try:
+                domain = self._get_value('方能域名')
+                user_agent = self._get_value('user-agent')
+                current_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+                if not domain or not current_cookie:
+                    print("⏳ [轮询] Cookie 或域名为空，跳过本轮。")
+                    time.sleep(60)
+                    continue
+
+                headers = {
+                    'user-agent': user_agent,
+                    'x-requested-with': 'XMLHttpRequest',
+                    'cookie': current_cookie
+                }
+
+                url = f"https://{domain}/PassManage/Pass/GetPageListJson?page=1&limit=10"
+                res = requests.get(url, headers=headers, timeout=10)
+                print("📦 [轮询] 方能响应状态码：", res.status_code)
+
+                set_cookie = res.headers.get("Set-Cookie", "")
+                match = re.search(r'UserToken=([^;]+)', set_cookie)
+                if match:
+                    new_token = match.group(1)
+                    new_cookie = f"UserToken={new_token}"
+
+                    decoded_old = urllib.parse.unquote(current_cookie.replace("UserToken=", "").strip())
+                    decoded_new = urllib.parse.unquote(new_token.strip())
+
+                    if decoded_new != decoded_old:
+                        print("🔁 [轮询] 检测到 Cookie 更新，自动替换")
+                        QTimer.singleShot(0, partial(self._update_cookie_ui, new_cookie))
+                        QTimer.singleShot(0, partial(QMessageBox.information,
+                                                     self, "Cookie 更新", "🔁 检测到新的 UserToken，已自动更新！"))
+                    else:
+                        print("✅ [轮询] Cookie 内容一致")
+                else:
+                    print("ℹ️ [轮询] 响应中无 Set-Cookie")
+
+            except Exception as e:
+                print("⚠️ [轮询] 检查异常：", str(e))
+
+            print("🕒 [轮询] 等待 5 分钟后继续...")
+            time.sleep(5 * 60)
+
+    def _update_cookie_ui(self, cookie_value: str):
+        w = self.fields.get('方能_cookie')
+        if isinstance(w, QTextEdit):
+            w.setPlainText(cookie_value)
+
+    # ============== 方能登录获取 Cookie ==============
+    def _login_fangneng_and_update_cookie(self):
+        username = self._get_value('方能账号')
+        password = self._get_value('方能密码')
+        googlecode = self._get_value('方能验证码')
+        domain = self._get_value('方能域名')
+        user_agent = self._get_value('user-agent')
+
+        if not username or not password or not googlecode or not domain or not user_agent:
+            QMessageBox.critical(self, "错误", " 请先填写完整的方能配置")
+            return
+
+        session = requests.Session()
+        headers = {
+            'user-agent': user_agent,
+            'x-requested-with': 'XMLHttpRequest',
+        }
+
+        try:
+            session.get(f"https://{domain}/Home/Login", headers=headers, timeout=5)
+            data = {'username': username, 'password': password, 'googlecode': googlecode}
+            res = session.post(f"https://{domain}/Home/LoginJson", headers=headers, data=data, timeout=10)
+            token = session.cookies.get("UserToken")
+            if token:
+                self._set_value('方能_cookie', f"UserToken={token}", is_text=True)
+                QMessageBox.information(self, "登录成功", f"✅ 登录成功，已获取 UserToken。\n{token}")
+            else:
+                QMessageBox.critical(self, "登录失败", f"❌ 登录失败，响应内容：\n{res.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "异常", f"⚠️ 登录请求异常：{str(e)}")
+
+    # ===================== 配置存取（统一保存所有页面） =====================
+    def _save_config(self):
+        config = configparser.ConfigParser(interpolation=None)
+        config['DEFAULT'] = {
+            k: (v.toPlainText() if isinstance(v, QTextEdit) else v.text())
+            for k, v in self.fields.items()
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                config.write(f)
+            QMessageBox.information(self, "成功", "✅ 配置已保存")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def _load_config(self):
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read(CONFIG_FILE, encoding='utf-8')
+            for k, w in self.fields.items():
+                if k in config['DEFAULT']:
+                    if isinstance(w, QTextEdit):
+                        w.setPlainText(config['DEFAULT'][k])
+                    else:
+                        w.setText(config['DEFAULT'][k])
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"加载配置失败: {e}")
+
+    # ===================== 工具函数 =====================
+    def _get_value(self, key: str, is_text: bool = False) -> str:
+        w = self.fields.get(key)
+        if not w:
+            return ""
+        if is_text and isinstance(w, QTextEdit):
+            return w.toPlainText()
+        return w.text() if hasattr(w, 'text') else ""
+
+    def _set_value(self, key: str, val: str, is_text: bool = False):
+        w = self.fields.get(key)
+        if not w:
+            return
+        if is_text and isinstance(w, QTextEdit):
+            w.setPlainText(val)
+        elif hasattr(w, 'setText'):
+            w.setText(val)
+
+    # ===================== Telegram =====================
+    def _send_telegram(self, message: str):
+        bot_token = self._get_value('机器人Token')
+        chat_id = self._get_value('群组ID')
+        if not bot_token or not chat_id:
+            print("⚠️ 未配置 Telegram 信息，跳过发送。")
+            return
+        url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+        data = {'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'}
+        try:
+            requests.post(url, data=data, timeout=8)
+        except Exception as e:
+            print(f"发送 Telegram 消息失败: {e}")
+
+    # ===================== 统一“运行程序”入口 =====================
+    def _run_all_sync_threaded(self):
+        t = threading.Thread(target=self._run_all_sync, daemon=True)
+        t.start()
+
+    def _run_all_sync(self):
+        self._send_telegram("✅ 程序启动：\n（天鸿/全合/太阳城/汉庭/尊享/易通/兆锋/大家发 → 方能）")
+        # 天鸿 → 方能
+        try:
+            self._run_tianhong_to_fangneng()
+        except Exception as e:
+            print(f"❌ 天鸿→方能 同步异常：{e}")
+        # 全合 → 方能
+        try:
+            self._run_quanhe_to_fangneng()
+        except Exception as e:
+            print(f"❌ 全合→方能 同步异常：{e}")
+
+        # 太阳城 → 方能
+        try:
+            self._run_suncity_to_fangneng()
+        except Exception as e:
+            print(f"❌ 太阳城→方能 同步异常：{e}")
+
+        # 汉庭 → 方能
+        try:
+            self._run_hanting_to_fangneng()
+        except Exception as e:
+            print(f"❌ 汉庭→方能 同步异常：{e}")
+
+        # 尊享 → 方能
+        try:
+            self._run_xinzunxiang_to_fangneng()
+        except Exception as e:
+            print(f"❌ 尊享→方能 同步异常：{e}")
+
+        # 易通 → 方能
+        try:
+            self._run_yitong_to_fangneng()
+        except Exception as e:
+            print(f"❌ 易通→方能 同步异常：{e}")
+
+        # 兆锋 → 方能
+        try:
+            self._run_zhaofeng_to_fangneng()
+        except Exception as e:
+            print(f"❌ 兆锋→方能 同步异常：{e}")
+
+        # 大家发 → 方能
+        try:
+            self._run_dajiafa_to_fangneng()
+        except Exception as e:
+            print(f"❌ 大家发→方能 同步异常：{e}")
+
+    # ===================== 天鸿→方能 主流程 =====================
+    def _run_tianhong_to_fangneng(self):
+        th_host = self._get_value('天鸿域名(port)').strip()
+        th_cookie = self._get_value('天鸿cookie').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not th_host or not th_cookie or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [天鸿] 配置缺失，跳过本次同步。")
+            print("⚠️ [天鸿] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [天鸿] 开始抓取...")
+        tianhong_url = f"https://{th_host}/user_Channel_index.html"
+        th_headers = {'cookie': th_cookie}
+        tianhong_map = {}  # {code: rate_decimal_4}
+
+        try:
+            html = self._http_get_text(tianhong_url, th_headers, verify=True)
+            for code, rate_raw in self._tianhong_extract_rows(html):
+                try:
+                    rate_val = self._normalize_rate(rate_raw)  # 统一换算为四位小数比例
+                    tianhong_map[str(code).strip()] = rate_val
+                except Exception as e:
+                    print(f"⚠️ [天鸿] 费率解析失败 ({code}, {rate_raw}): {e}")
+            print(f"✅ [天鸿] 抓取完成，通道数：{len(tianhong_map)}")
+        except Exception as e:
+            print(f"❌ [天鸿] 抓取异常：{e}")
+
+        if not tianhong_map:
+            self._send_telegram("⚠️ [天鸿] 抓取为空，停止本次同步。")
+            return
+
+        self._diff_and_update_to_fangneng(
+            supplier_name="天鸿",
+            target_map=tianhong_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 全合→方能 主流程 =====================
+    def _run_quanhe_to_fangneng(self):
+        qh_host = self._get_value('全合域名(port)').strip()
+        qh_cookie = self._get_value('全合cookie').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not qh_host or not qh_cookie or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [全合] 配置缺失，跳过本次同步。")
+            print("⚠️ [全合] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [全合] 开始抓取...")
+        quanhe_url = f"http://{qh_host}/agent_Channel_index.html"
+        qh_headers = {'Cookie': qh_cookie}
+        quanhe_map = {}  # {code: rate_decimal_4}
+
+        try:
+            html = self._http_get_text(quanhe_url, qh_headers, verify=False)
+            for code, rate_raw in self._quanhe_extract_rows(html):
+                try:
+                    # 支持“110 ‰ / 150 ‰ / 90 ‰ / 55 ‰ / 60 ‰”等，自动换算为四位小数比例
+                    rate_val = self._normalize_rate(rate_raw)
+                    quanhe_map[str(code).strip()] = rate_val
+                except Exception as e:
+                    print(f"⚠️ [全合] 费率解析失败 ({code}, {rate_raw}): {e}")
+            print(f"✅ [全合] 抓取完成，通道数：{len(quanhe_map)}")
+        except Exception as e:
+            print(f"❌ [全合] 抓取异常：{e}")
+
+        if not quanhe_map:
+            self._send_telegram("⚠️ [全合] 抓取为空，停止本次同步。")
+            return
+
+        self._diff_and_update_to_fangneng(
+            supplier_name="全合支付",
+            target_map=quanhe_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 太阳城→方能 主流程 =====================
+    def _run_suncity_to_fangneng(self):
+        sc_host = self._get_value('太阳城域名(port)').strip()
+        sc_token = self._get_value('太阳城access_token').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not sc_host or not sc_token or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [太阳城] 配置缺失，跳过本次同步。")
+            print("⚠️ [太阳城] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [太阳城] 开始抓取...")
+        # 太阳城接口（支持翻页；一次拉100条，按需翻页）
+        base_url = f'http://{sc_host}/api/mch_pay_passage/list'
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+
+        suncity_map = {}  # {code: rate_decimal_4}
+        page = 1
+        limit = 100
+        while True:
+            params = {
+                'page': str(page),
+                'limit': str(limit),
+                'access_token': sc_token,
+            }
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, verify=False, timeout=15)
+                if resp.status_code != 200:
+                    print(f"❌ [太阳城] HTTP {resp.status_code}：{resp.text[:200]}")
+                    break
+                js = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+                data = js.get('data', []) or js.get('PageData', []) or []
+                if not isinstance(data, list):
+                    print("⚠️ [太阳城] 返回格式异常，未见数组 data")
+                    break
+                if not data:
+                    break
+
+                for row in data:
+                    code = str(row.get('productId', '')).strip()
+                    rate_raw = str(row.get('mchRate', '')).strip()
+                    if not code or not rate_raw:
+                        continue
+                    try:
+                        # 这里的 mchRate 是裸数字百分比，如 13.0 -> 0.1300
+                        rate_val = self._normalize_rate(rate_raw)
+                        suncity_map[code] = rate_val
+                    except Exception as e:
+                        print(f"⚠️ [太阳城] 费率解析失败 ({code}, {rate_raw}): {e}")
+
+                # 翻页判断
+                if len(data) < limit:
+                    break
+                page += 1
+            except Exception as e:
+                print(f"⚠️ [太阳城] 抓取异常：{e}")
+                break
+
+        print(f"✅ [太阳城] 抓取完成，通道数：{len(suncity_map)}")
+        if not suncity_map:
+            self._send_telegram("⚠️ [太阳城] 抓取为空，停止本次同步。")
+            return
+
+        # 写入方能（在方能中，name=太阳城）
+        self._diff_and_update_to_fangneng(
+            supplier_name="太阳城",
+            target_map=suncity_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 汉庭→方能 主流程 =====================
+    def _run_hanting_to_fangneng(self):
+        ht_host = self._get_value('汉庭域名(port)').strip()
+        ht_cookie = self._get_value('汉庭cookie').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not ht_host or not ht_cookie or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [汉庭] 配置缺失，跳过本次同步。")
+            print("⚠️ [汉庭] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [汉庭] 开始抓取...")
+        hanting_url = f"http://{ht_host}/agent_Channel_index.html"
+        ht_headers = {'Cookie': ht_cookie}
+        hanting_map = {}  # {code: rate_decimal_4}
+
+        try:
+            html = self._http_get_text(hanting_url, ht_headers, verify=False)
+            # 直接复用“全合”的表格解析器（同结构）
+            for code, rate_raw in self._quanhe_extract_rows(html):
+                try:
+                    rate_val = self._normalize_rate(rate_raw)  # 统一转成四位小数比例
+                    hanting_map[str(code).strip()] = rate_val
+                except Exception as e:
+                    print(f"⚠️ [汉庭] 费率解析失败 ({code}, {rate_raw}): {e}")
+            print(f"✅ [汉庭] 抓取完成，通道数：{len(hanting_map)}")
+        except Exception as e:
+            print(f"❌ [汉庭] 抓取异常：{e}")
+
+        if not hanting_map:
+            self._send_telegram("⚠️ [汉庭] 抓取为空，停止本次同步。")
+            return
+
+        # 写回方能：注意供应商名用“汉庭”
+        self._diff_and_update_to_fangneng(
+            supplier_name="汉庭",
+            target_map=hanting_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 尊享→方能 主流程 =====================
+    def _run_xinzunxiang_to_fangneng(self):
+        host = self._get_value('尊享域名(port)').strip()
+        itoken = self._get_value('尊享itoken').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not host or not itoken or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [尊享] 配置缺失，跳过本次同步。")
+            print("⚠️ [尊享] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [尊享] 开始抓取...")
+        base_url = f'https://{host}/api/mchApps'
+        headers = {
+            'accept': 'application/json, text/plain, */*',
+            'itoken': itoken,  # 关键：认证放在请求头 itoken
+        }
+
+        xzx_map = {}  # {code: rate_decimal_4}
+        page = 1
+        page_size = 100
+        while True:
+            params = {'pageNumber': str(page), 'pageSize': str(page_size)}
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, timeout=15)
+                if resp.status_code != 200:
+                    print(f"❌ [尊享] HTTP {resp.status_code}：{resp.text[:200]}")
+                    break
+
+                js = resp.json()
+                records = (js.get('data', {}) or {}).get('records', [])
+                if not isinstance(records, list):
+                    print("⚠️ [尊享] 返回格式异常，未见数组 data.records")
+                    break
+                if not records:
+                    break
+
+                for row in records:
+                    code = str(row.get('productId', '')).strip()
+                    rate_raw = str(row.get('mchRate', '')).strip()
+                    if not code or not rate_raw:
+                        continue
+                    try:
+                        # 裸数字按百分比：13.0 -> 0.1300；5.3 -> 0.0530
+                        rate_val = self._normalize_rate(rate_raw)
+                        xzx_map[code] = rate_val
+                    except Exception as e:
+                        print(f"⚠️ [尊享] 费率解析失败 ({code}, {rate_raw}): {e}")
+
+                if len(records) < page_size:
+                    break
+                page += 1
+
+            except Exception as e:
+                print(f"⚠️ [尊享] 抓取异常：{e}")
+                break
+
+        print(f"✅ [尊享] 抓取完成，通道数：{len(xzx_map)}")
+        if not xzx_map:
+            self._send_telegram("⚠️ [尊享] 抓取为空，停止本次同步。")
+            return
+
+        # 写回方能：supplier_name 要与方能后台“供应商名称”一致
+        self._diff_and_update_to_fangneng(
+            supplier_name="尊享",
+            target_map=xzx_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 易通→方能 主流程 =====================
+    def _run_yitong_to_fangneng(self):
+        yt_host = self._get_value('易通域名(port)').strip()
+        yt_token = self._get_value('易通access_token').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not yt_host or not yt_token or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [易通] 配置缺失，跳过本次同步。")
+            print("⚠️ [易通] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [易通] 开始抓取...")
+        base_url = f'http://{yt_host}/api/mch_pay_passage/list'
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+
+        yitong_map = {}  # {code: rate_decimal_4}
+        page = 1
+        limit = 100
+        while True:
+            params = {
+                'page': str(page),
+                'limit': str(limit),
+                'access_token': yt_token,  # 关键：与太阳城一致，用 query 参数
+            }
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, verify=False, timeout=15)
+                if resp.status_code != 200:
+                    print(f"❌ [易通] HTTP {resp.status_code}：{resp.text[:200]}")
+                    break
+
+                js = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+                data = js.get('data', []) or js.get('PageData', []) or []
+                if not isinstance(data, list):
+                    print("⚠️ [易通] 返回格式异常，未见数组 data")
+                    break
+                if not data:
+                    break
+
+                for row in data:
+                    code = str(row.get('productId', '')).strip()
+                    rate_raw = str(row.get('mchRate', '')).strip()
+                    if not code or not rate_raw:
+                        continue
+                    try:
+                        # 裸数字按百分比：13.0 -> 0.1300；5.5 -> 0.0550
+                        rate_val = self._normalize_rate(rate_raw)
+                        yitong_map[code] = rate_val
+                    except Exception as e:
+                        print(f"⚠️ [易通] 费率解析失败 ({code}, {rate_raw}): {e}")
+
+                if len(data) < limit:
+                    break
+                page += 1
+
+            except Exception as e:
+                print(f"⚠️ [易通] 抓取异常：{e}")
+                break
+
+        print(f"✅ [易通] 抓取完成，通道数：{len(yitong_map)}")
+        if not yitong_map:
+            self._send_telegram("⚠️ [易通] 抓取为空，停止本次同步。")
+            return
+
+        # 写回方能：注意 supplier_name 要与方能后台“供应商名称”一致
+        self._diff_and_update_to_fangneng(
+            supplier_name="易通",
+            target_map=yitong_map,
+            fn_domain=self._get_value('方能域名').strip(),
+            fn_ua=self._get_value('user-agent').strip(),
+            fn_cookie=self._get_value('方能_cookie', is_text=True).strip()
+        )
+
+    # ===================== 兆锋→方能 主流程 =====================
+    def _run_zhaofeng_to_fangneng(self):
+        zf_host = self._get_value('兆锋域名(port)').strip()
+        zf_token = self._get_value('兆锋access_token').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not zf_host or not zf_token or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [兆锋] 配置缺失，跳过本次同步。")
+            print("⚠️ [兆锋] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [兆锋] 开始抓取...")
+        base_url = f'http://{zf_host}/api/mch_pay_passage/list'
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+
+        zhaofeng_map = {}  # {code: rate_decimal_4}
+        page = 1
+        limit = 100
+        while True:
+            params = {
+                'page': str(page),
+                'limit': str(limit),
+                'access_token': zf_token,  # 与太阳城/易通一致：query 传 token
+            }
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, verify=False, timeout=15)
+                if resp.status_code != 200:
+                    print(f"❌ [兆锋] HTTP {resp.status_code}：{resp.text[:200]}")
+                    break
+
+                js = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+                data = js.get('data', []) or js.get('PageData', []) or []
+                if not isinstance(data, list):
+                    print("⚠️ [兆锋] 返回格式异常，未见数组 data")
+                    break
+                if not data:
+                    break
+
+                for row in data:
+                    code = str(row.get('productId', '')).strip()
+                    rate_raw = str(row.get('mchRate', '')).strip()
+                    if not code or not rate_raw:
+                        continue
+                    try:
+                        # 裸数字按百分比：如 13.0 -> 0.1300；5.5 -> 0.0550
+                        rate_val = self._normalize_rate(rate_raw)
+                        zhaofeng_map[code] = rate_val
+                    except Exception as e:
+                        print(f"⚠️ [兆锋] 费率解析失败 ({code}, {rate_raw}): {e}")
+
+                if len(data) < limit:
+                    break
+                page += 1
+
+            except Exception as e:
+                print(f"⚠️ [兆锋] 抓取异常：{e}")
+                break
+
+        print(f"✅ [兆锋] 抓取完成，通道数：{len(zhaofeng_map)}")
+        if not zhaofeng_map:
+            self._send_telegram("⚠️ [兆锋] 抓取为空，停止本次同步。")
+            return
+
+        # 写回方能：supplier_name 要与方能后台“供应商名称”一致
+        self._diff_and_update_to_fangneng(
+            supplier_name="兆锋",
+            target_map=zhaofeng_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 大家发→方能 主流程 =====================
+    def _run_dajiafa_to_fangneng(self):
+        dajiafa_host = self._get_value('大家发域名(port)').strip()
+        dajiafa_token = self._get_value('大家发access_token').strip()
+
+        fn_domain = self._get_value('方能域名').strip()
+        fn_ua = self._get_value('user-agent').strip()
+        fn_cookie = self._get_value('方能_cookie', is_text=True).strip()
+
+        if not dajiafa_host or not dajiafa_token or not fn_domain or not fn_ua or not fn_cookie:
+            self._send_telegram("⚠️ [大家发] 配置缺失，跳过本次同步。")
+            print("⚠️ [大家发] 配置缺失，跳过本次同步。")
+            return
+
+        print("🟡 [大家发] 开始抓取...")
+        base_url = f'http://{dajiafa_host}/api/mch_pay_passage/list'
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+
+        dajiafa_map = {}  # {code: rate_decimal_4}
+        page = 1
+        limit = 100
+        while True:
+            params = {
+                'page': str(page),
+                'limit': str(limit),
+                'access_token': dajiafa_token,  # 与太阳城/易通一致：query 传 token
+            }
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, verify=False, timeout=15)
+                if resp.status_code != 200:
+                    print(f"❌ [大家发] HTTP {resp.status_code}：{resp.text[:200]}")
+                    break
+
+                js = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+                data = js.get('data', []) or js.get('PageData', []) or []
+                if not isinstance(data, list):
+                    print("⚠️ [大家发] 返回格式异常，未见数组 data")
+                    break
+                if not data:
+                    break
+
+                for row in data:
+                    code = str(row.get('productId', '')).strip()
+                    rate_raw = str(row.get('mchRate', '')).strip()
+                    if not code or not rate_raw:
+                        continue
+                    try:
+                        # 裸数字按百分比：如 13.0 -> 0.1300；5.5 -> 0.0550
+                        rate_val = self._normalize_rate(rate_raw)
+                        dajiafa_map[code] = rate_val
+                    except Exception as e:
+                        print(f"⚠️ [大家发] 费率解析失败 ({code}, {rate_raw}): {e}")
+
+                if len(data) < limit:
+                    break
+                page += 1
+
+            except Exception as e:
+                print(f"⚠️ [大家发] 抓取异常：{e}")
+                break
+
+        print(f"✅ [大家发] 抓取完成，通道数：{len(dajiafa_map)}")
+        if not dajiafa_map:
+            self._send_telegram("⚠️ [大家发] 抓取为空，停止本次同步。")
+            return
+
+        # 写回方能：supplier_name 要与方能后台“供应商名称”一致
+        self._diff_and_update_to_fangneng(
+            supplier_name="大家发",
+            target_map=dajiafa_map,
+            fn_domain=fn_domain,
+            fn_ua=fn_ua,
+            fn_cookie=fn_cookie
+        )
+
+    # ===================== 通用：比对并更新到方能 =====================
+    def _diff_and_update_to_fangneng(self, supplier_name: str, target_map: dict, fn_domain: str, fn_ua: str,
+                                     fn_cookie: str):
+        print(f"🟡 [方能] 开始查询“{supplier_name}”通道...")
+        查询接口 = f'https://{fn_domain}/PassManage/Pass/GetPageListJson'
+        更新接口 = f'https://{fn_domain}/PassManage/Pass/EditChannelTypeConf'
+        headers_fn = {'cookie': fn_cookie, 'user-agent': fn_ua, 'x-requested-with': 'XMLHttpRequest'}
+
+        # 拉取方能“supplier_name”名下通道
+        fangneng_items = {}
+        page, limit = 1, 100
+        while True:
+            params = {'page': str(page), 'limit': str(limit), 'name': supplier_name, 'tGGroupId': '', 'state': '1'}
+            try:
+                r = requests.get(查询接口, params=params, headers=headers_fn, timeout=12)
+                if r.status_code != 200:
+                    print(f"❌ [方能] 查询失败，状态码: {r.status_code}")
+                    break
+                js = r.json()
+                page_data = js.get('PageData', []) or js.get('data', []) or []
+                if not page_data:
+                    break
+                for it in page_data:
+                    ch_type = str(it.get('ChannelType', '')).strip()
+                    if ch_type:
+                        fangneng_items[ch_type] = it
+                if len(page_data) < limit:
+                    break
+                page += 1
+            except Exception as e:
+                print(f"⚠️ [方能] 查询异常：{e}")
+                break
+
+        print(f"✅ [方能] 命中“{supplier_name}”通道数：{len(fangneng_items)}")
+        if not fangneng_items:
+            self._send_telegram(f"⚠️ [方能] 未找到名称为“{supplier_name}”的通道。")
+            return
+
+        # 比对并更新
+        print("🟡 开始逐条更新（仅费率不一致才更新，间隔1秒）...")
+        成功数量 = 0
+        跳过数量 = 0
+        未匹配数量 = 0
+        成功列表 = []
+
+        for ch_code, item in fangneng_items.items():
+            target_rate = target_map.get(ch_code)
+            if target_rate is None:
+                未匹配数量 += 1
+                print(f"⏭ [未匹配] 方能有编码 {ch_code}，来源“{supplier_name}”未提供，跳过")
+                continue
+
+            current_rate_raw = str(item.get('PassChannelTypeConfRate', '')).strip()
+            try:
+                current_rate = self._normalize_rate(current_rate_raw)
+            except Exception as e:
+                print(f"⚠️ [费率异常] 编码 {ch_code} 当前费率无法解析({current_rate_raw})：{e}，跳过")
+                跳过数量 += 1
+                continue
+
+            if round(current_rate, 4) == round(target_rate, 4):
+                print(f"⏭ 编码 {ch_code} 费率一致（{current_rate:.4f}），跳过")
+                跳过数量 += 1
+                continue
+
+            payload = {
+                'Id': item.get('PassChannelTypeConfId'),
+                'Status': '1',
+                'PassId': '',
+                'remark': item.get('PassCodeName'),
+                'Rate': f"{target_rate:.4f}",  # 小数形式，四位
+                'AmountRange': item.get('AmountRange'),
+                'ChannelType': item.get('ChannelType'),
+                'AgentRate': '0',
+            }
+            try:
+                res = requests.post(更新接口, data=payload, headers=headers_fn, timeout=12)
+                if res.status_code == 200:
+                    成功数量 += 1
+                    成功列表.append(f"{ch_code} {current_rate:.4f} → {target_rate:.4f}")
+                    print(f"✅ 编码 {ch_code} 更新成功：{current_rate:.4f} → {target_rate:.4f}")
+                else:
+                    print(f"❌ 更新失败 编码 {ch_code}，HTTP {res.status_code}，返回：{res.text[:200]}")
+                time.sleep(1)
+            except Exception as e:
+                print(f"⚠️ 更新异常 编码 {ch_code}：{e}")
+
+        明细文本 = "无" if not 成功列表 else "\n".join(成功列表[:50])
+        msg = (
+            f"📢 *{supplier_name}→方能 费率同步完成*\n"
+            f"✅ 成功更新：*{成功数量}*\n"
+            f"⏭ 费率一致跳过：*{跳过数量}*\n"
+            f"❓ 方能有但来源无（跳过）：*{未匹配数量}*\n"
+            f"📦 方能“{supplier_name}”通道总数：*{len(fangneng_items)}*\n"
+            f"🧾 更新明细（前50条）：\n{明细文本}\n"
+            f"⏰ 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        if 成功数量 > 0:
+            self._send_telegram(msg)
+
+        # UI 提示
+        def show_finish():
+            QMessageBox.information(
+                self, f"{supplier_name}→方能 完成",
+                f"✅ 成功更新：{成功数量} 条\n"
+                f"⏭ 费率一致：{跳过数量} 条\n"
+                f"❓ 方能有但来源无：{未匹配数量} 条\n"
+                f"📦 方能“{supplier_name}”通道：{len(fangneng_items)} 条"
+            )
+
+        QTimer.singleShot(0, show_finish)
+
+    # ===================== 天鸿抓取工具 =====================
+    @staticmethod
+    def _http_get_text(url: str, headers: dict, verify: bool) -> str:
+        resp = requests.get(url, headers=headers, verify=verify, timeout=20)
+        resp.raise_for_status()
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        return resp.text
+
+    @staticmethod
+    def _tianhong_extract_rows(html: str):
+        """
+        解析天鸿表格，返回 (通道编码, 费率字符串)，如 ('2008', '17.5%')
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        tables = soup.select("table.layui-table")
+        for tbl in tables:
+            thead = tbl.find("thead")
+            if not thead:
+                continue
+            head_text = " ".join(thead.get_text(separator=" ", strip=True).split())
+            if all(k in head_text for k in ["通道编码", "通道费率"]):
+                tbody = tbl.find("tbody")
+                if not tbody:
+                    continue
+                for tr in tbody.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if len(tds) < 3:
+                        continue
+                    code = tds[0].get_text(strip=True)
+                    rate = tds[2].get_text(strip=True)
+                    if code:
+                        yield code, rate
+
+    # ===================== 全合抓取工具 =====================
+    @staticmethod
+    def _quanhe_extract_rows(html: str):
+        """
+        解析全合页面任意包含“编码/费率”的表格，返回 (商户编码, 费率字符串)
+        例：'6666 110 ‰'、'8001 150 ‰' 等
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        for tbl in soup.select("table"):
+            thead = tbl.find("thead")
+            if not thead:
+                continue
+            ths = [(" ".join(th.get_text(strip=True).split())) for th in thead.find_all("th")]
+            idx_code = None
+            idx_rate = None
+            for i, t in enumerate(ths):
+                if t in ("编码", "通道编码"):
+                    idx_code = i
+                if ("费率" in t) or ("通道费率" in t):
+                    idx_rate = i
+            if idx_code is None or idx_rate is None:
+                continue
+
+            tbody = tbl.find("tbody")
+            if not tbody:
+                continue
+
+            for tr in tbody.find_all("tr"):
+                tds = tr.find_all("td")
+                if len(tds) <= max(idx_code, idx_rate):
+                    continue
+                code = tds[idx_code].get_text(strip=True)
+                rate_raw = tds[idx_rate].get_text(strip=True)
+                rate_norm = " ".join(rate_raw.split())  # 规范空白，保留“‰”
+                if code and rate_norm:
+                    yield code, rate_norm
+            # 找到首个匹配表后即可结束
+            break
+
+    # ===================== 费率统一换算：四位小数 =====================
+    @staticmethod
+    def _normalize_rate(rate_str: str) -> float:
+        """
+        支持：
+          - '17.5%' / '17%' / '17.5 %'  -> 0.1750
+          - '110 ‰' / '110‰' / '150 ‰' -> 0.1100 / 0.1500
+          - '0.175'（小数）              -> 0.1750
+          - '17.5'（裸数，按百分比）     -> 0.1750
+        """
+        s = (rate_str or "").strip()
+        s = s.replace(',', '')  # 去千分位逗号
+        # 有千分号
+        if '‰' in s:
+            num = s.replace('‰', '').strip()
+            v = float(num) / 1000.0
+            return round(v, 4)
+        # 有百分号
+        if s.endswith('%') or s.endswith(' %'):
+            num = s.replace('%', '').strip()
+            v = float(num) / 100.0
+            return round(v, 4)
+        # 纯数字：判断是否当成百分比（与原程序保持一致：裸数按百分比）
+        # 若已是小数，如 0.175 -> 直接四舍五入
+        try:
+            val = float(s)
+            if val > 1:  # 形如 17.5 -> 17.5%
+                return round(val / 100.0, 4)
+            return round(val, 4)
+        except:
+            # 再尝试：提取数字+可选小数
+            m = re.search(r'(-?\d+(?:\.\d+)?)', s)
+            if not m:
+                raise ValueError(f"无法解析费率：{rate_str}")
+            val = float(m.group(1))
+            if ('‰' in rate_str):
+                return round(val / 1000.0, 4)
+            return round((val / 100.0 if val > 1 else val), 4)
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    w = App()
+    w.show()
+    sys.exit(app.exec_())
